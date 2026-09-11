@@ -239,6 +239,16 @@ const modelRouteStub = {
   currentSelection: () => ({ provider: 'fake-provider', model: 'fake-model', reasoningEffort: 'low' }),
 }
 
+/** Session logs the fake `sessions` service serves, keyed by session id. */
+const sessionLogs = new Map()
+
+const sessionsStub = {
+  get(id) {
+    const events = sessionLogs.get(id)
+    return events === undefined ? undefined : { snapshotEvents: () => events }
+  },
+}
+
 /** The store reads DSH_HOME at apply() time, so the real ~/.dsh is untouched. */
 process.env.DSH_HOME = home
 
@@ -246,6 +256,65 @@ const SESSION = 'session-test-1'
 
 const { apply } = await import(new URL('../lib/index.js', import.meta.url).href)
 const { buildSummaryInput, cleanSummary } = await import(new URL('../lib/summarize.js', import.meta.url).href)
+const { buildTimeline } = await import(new URL('../lib/timeline.js', import.meta.url).href)
+
+console.log('\n== folding a session log into a turn journal ==')
+const folded = buildTimeline([
+  { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+  { type: 'user/message', seq: 2, time: 101, data: { content: [{ type: 'text', text: '实现登录接口' }] } },
+  { type: 'assistant/message', seq: 3, time: 110, data: { turn: 1, step: 1, message: {} } },
+  { type: 'turn/end', seq: 4, time: 120, data: { turn: 1, reason: { kind: 'completed' } } },
+  { type: 'turn/start', seq: 5, time: 200, data: { turn: 2 } },
+  { type: 'user/message', seq: 6, time: 201, data: { content: [{ type: 'text', text: '改成 ok' }] } },
+  { type: 'turn/end', seq: 7, time: 210, data: { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+  // A turn that has started but never ended: no fork boundary exists for it.
+  { type: 'turn/start', seq: 8, time: 300, data: { turn: 3 } },
+])
+check('one entry per turn', folded.length === 3, String(folded.length))
+check('turns keep their order', folded.map((entry) => entry.turn).join(',') === '1,2,3',
+  folded.map((entry) => entry.turn).join(','))
+check('a closed turn carries its closing sequence',
+  folded[0].seq === 4 && folded[1].seq === 7, JSON.stringify(folded.map((entry) => entry.seq)))
+check('an open turn has no boundary', folded[2].seq === null, JSON.stringify(folded[2].seq))
+check('the prompt is the first user message', folded[0].prompt === '实现登录接口',
+  JSON.stringify(folded[0].prompt))
+check('the end reason is kept', folded[1].endReason === 'aborted', JSON.stringify(folded[1].endReason))
+check('assistant steps are counted', folded[0].steps === 1, String(folded[0].steps))
+check('the turn time is its closing time', folded[0].at === 120, String(folded[0].at))
+
+const steered = buildTimeline([
+  { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+  { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '原始请求' }] } },
+  { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '插话' }] } },
+  { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+])
+check('a steering message does not rewrite the prompt', steered[0].prompt === '原始请求',
+  JSON.stringify(steered[0].prompt))
+
+const beforeStart = buildTimeline([
+  { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '先到的消息' }] } },
+  { type: 'turn/start', seq: 2, time: 2, data: { turn: 1 } },
+  { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+])
+check('a user message before turn/start still becomes the prompt',
+  beforeStart[0].prompt === '先到的消息', JSON.stringify(beforeStart[0].prompt))
+
+const retried = buildTimeline([
+  { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+  { type: 'turn/end', seq: 2, time: 2, data: { turn: 1, reason: { kind: 'error', error: {} } } },
+  { type: 'turn/start', seq: 3, time: 3, data: { turn: 1 } },
+  { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+])
+check('a retried turn collapses to one entry', retried.length === 1, String(retried.length))
+check('the retried entry keeps the newest boundary', retried[0].seq === 4, String(retried[0].seq))
+
+check('junk events are ignored',
+  buildTimeline([null, {}, { type: 'turn/start' }, 'x', { type: 'turn/end' }]).length === 0,
+  JSON.stringify(buildTimeline([null, {}, { type: 'turn/start' }, 'x', { type: 'turn/end' }])))
+check('a long prompt is clipped', buildTimeline([
+  { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+  { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: 'x'.repeat(600) }] } },
+])[0].prompt.length <= 300)
 
 console.log('\n== the title cleaner ==')
 check('strips a wrapping quote pair', cleanSummary('"修复登录接口"') === '修复登录接口',
@@ -517,7 +586,7 @@ try {
   // fallback exercised above stays covered by the same assertions it had.
   // -------------------------------------------------------------------------
   console.log('\n== a model title becomes the commit subject ==')
-  const aiCtx = createContext({ llm: llmStub, agentDefaultModel: modelRouteStub })
+  const aiCtx = createContext({ llm: llmStub, agentDefaultModel: modelRouteStub, sessions: sessionsStub })
   apply(aiCtx)
   const aiServer = await serve(aiCtx)
   const ai = join(sandbox, 'ai')
@@ -672,6 +741,51 @@ try {
   await call(aiServer.base, '/chat-git/models', {})
   check('the catalogue is cached rather than re-probed each time',
     Date.now() - cachedCatalogue < 1000, `${String(Date.now() - cachedCatalogue)}ms`)
+
+  console.log('\n== the timeline route ==')
+  // A fresh session so the commit join is deterministic: turn 1 will have a
+  // checkpoint, turn 2 will not.
+  const timelineWorkspace = join(sandbox, 'timeline')
+  mkdirSync(timelineWorkspace, { recursive: true })
+  await aiCtx.emit('agent/session-start', start('session-timeline', timelineWorkspace))
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+  writeFileSync(join(timelineWorkspace, 'first.js'), 'export const first = 1\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-timeline', timelineWorkspace, 1, '第一轮的请求'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-timeline', timelineWorkspace, 1))
+  sessionLogs.set('session-timeline', [
+    { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, time: 101, data: { content: [{ type: 'text', text: '第一轮的请求' }] } },
+    { type: 'assistant/message', seq: 3, time: 110, data: { turn: 1, step: 1, message: {} } },
+    { type: 'turn/end', seq: 4, time: 120, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/start', seq: 5, time: 200, data: { turn: 2 } },
+    { type: 'user/message', seq: 6, time: 201, data: { content: [{ type: 'text', text: '第二轮的请求' }] } },
+    { type: 'turn/end', seq: 7, time: 210, data: { turn: 2, reason: { kind: 'completed' } } },
+  ])
+
+  const timeline = (await call(aiServer.base, '/chat-git/timeline', { sessionId: 'session-timeline' })).value
+  check('the route returns every turn in order',
+    timeline?.turns?.map((entry) => entry.turn).join(',') === '1,2',
+    JSON.stringify(timeline?.turns?.map((entry) => entry.turn)))
+  check('each turn carries its fork boundary',
+    timeline.turns[0].seq === 4 && timeline.turns[1].seq === 7,
+    JSON.stringify(timeline.turns.map((entry) => entry.seq)))
+  check('each turn carries its prompt',
+    timeline.turns[0].prompt === '第一轮的请求', JSON.stringify(timeline.turns[0].prompt))
+  check('the checkpoint is joined onto its turn',
+    typeof timeline.turns[0].commit?.sha === 'string' && timeline.turns[0].commit.sha !== '',
+    JSON.stringify(timeline.turns[0].commit))
+  check('the joined subject keeps the marker',
+    String(timeline.turns[0].commit?.subject).startsWith('Ai-coding：'),
+    String(timeline.turns[0].commit?.subject))
+  check('a turn with no checkpoint reports null', timeline.turns[1].commit === null,
+    JSON.stringify(timeline.turns[1].commit))
+  check('the route reports the workspace root', timeline.cwd === timelineWorkspace, String(timeline.cwd))
+  const unloaded = await call(aiServer.base, '/chat-git/timeline', { sessionId: 'session-not-loaded' })
+  check('a conversation that is not loaded is reported, not guessed',
+    unloaded.ok === false && unloaded.error.code === 'session-unavailable', JSON.stringify(unloaded))
+  const noTimelineId = await call(aiServer.base, '/chat-git/timeline', {})
+  check('the timeline needs a sessionId',
+    noTimelineId.ok === false && noTimelineId.error.code === 'bad-request', JSON.stringify(noTimelineId))
 
   console.log('\n== an absent model layer never costs a checkpoint ==')
   // No `llm` and no model route: the whole AI path must be skipped, not fatal.

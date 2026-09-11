@@ -90,6 +90,13 @@ const ReactStub = {
     hookStore.set(currentComponent, store)
     return fn
   },
+  /**
+   * React 18's external-store hook. Subscribing is a no-op here because the
+   * tests re-render by hand; the snapshot read is what matters.
+   */
+  useSyncExternalStore(_subscribe, getSnapshot) {
+    return getSnapshot()
+  },
 }
 
 /** Expand a tree of elements into host elements, invoking function components. */
@@ -183,6 +190,33 @@ const requests = []
  */
 let storedSummary = { mode: 'current', provider: '', model: '' }
 
+/** The timeline the fake host serves, including one turn that never closed. */
+let timelineTurns = [
+  {
+    turn: 1,
+    at: 0,
+    prompt: '实现登录接口',
+    seq: 10,
+    steps: 2,
+    endReason: 'completed',
+    commit: { sha: 'aaaa1111', short: 'aaaa111', subject: 'Ai-coding：实现登录接口' },
+  },
+  {
+    turn: 2,
+    at: 0,
+    prompt: '把登录返回值改成 ok',
+    seq: 20,
+    steps: 1,
+    endReason: 'completed',
+    commit: { sha: 'bbbb2222', short: 'bbbb222', subject: 'Ai-coding：把登录返回值改成 ok' },
+  },
+  // Still running: no closing sequence, so it has no fork boundary.
+  { turn: 3, at: 0, prompt: '正在进行的一轮', seq: null, steps: 0, endReason: '', commit: null },
+]
+
+/** Sessions the fake workspace service archived. */
+const archived = []
+
 /** Host answers for the routes the client half needs. */
 globalThis.fetch = async (url, init) => {
   const body = init === undefined ? {} : JSON.parse(init.body)
@@ -211,6 +245,8 @@ globalThis.fetch = async (url, init) => {
           : [],
       },
     }
+  } else if (url === '/chat-git/timeline') {
+    payload = { ok: true, value: { cwd: 'C:/ws', turns: timelineTurns } }
   } else if (url === '/chat-git/models') {
     payload = {
       ok: true,
@@ -313,6 +349,15 @@ const ctx = {
     },
     open: () => {},
   },
+  /** Optional services the plugin probes rather than injecting. */
+  get(name) {
+    if (name === 'workspaces') {
+      return {
+        archiveSession: async (sessionId) => { archived.push(sessionId) },
+      }
+    }
+    return undefined
+  },
   slots: {
     inject(name, callback) {
       registrations.push({ injectName: name, pending: true })
@@ -343,7 +388,7 @@ plugin.apply(ctx)
 console.log('\n== slot registration ==')
 check('every inject callback completed', registrations.every((entry) => entry.pending === false),
   JSON.stringify(registrations.filter((entry) => entry.pending).map((entry) => entry.injectName)))
-check('two seats are registered', registrations.length === 2,
+check('four seats are registered', registrations.length === 4,
   JSON.stringify(registrations.map((entry) => entry.injectName)))
 
 const actions = registrations.find((entry) => entry.injectName === 'conversation.chat.assistant-actions')
@@ -635,6 +680,138 @@ check('a stored model the registry no longer lists stays selectable',
   JSON.stringify((retiredPicker?.props?.children ?? []).map((option) => option?.props?.value)))
 check('the stored model is the selected one', retiredPicker?.props?.value === 'retired-model',
   String(retiredPicker?.props?.value))
+
+// ---------------------------------------------------------------------------
+// The conversation timeline panel
+// ---------------------------------------------------------------------------
+
+const timelineToggle = registrations.find((entry) => entry.injectName === 'conversation.session.header.actions')
+const timelinePanel = registrations.find((entry) => entry.injectName === 'shell.overlay')
+
+console.log('\n== the timeline seats ==')
+check('the toggle sits in the session header actions', timelineToggle !== undefined)
+check('the toggle declares its own id', timelineToggle?.options?.id === 'chat-git-timeline',
+  String(timelineToggle?.options?.id))
+check('the panel rides the frame overlay', timelinePanel !== undefined)
+check('the panel declares its own id', timelinePanel?.options?.id === 'chat-git-timeline-panel',
+  String(timelinePanel?.options?.id))
+check('the overlay entry is purely additive',
+  timelinePanel?.options?.select === undefined && timelinePanel?.options?.key === undefined,
+  JSON.stringify(timelinePanel?.options))
+
+const toggleNode = ReactStub.createElement(timelineToggle.component, { sessionId: 'session-live-1' })
+const panelNode = ReactStub.createElement(timelinePanel.component, {})
+
+console.log('\n== the panel starts closed ==')
+check('the panel renders nothing while closed', render(panelNode) === null)
+let toggle = render(toggleNode)
+check('the toggle is an icon button', findAll(toggle, 'svg').length === 1, String(findAll(toggle, 'svg').length))
+check('the toggle reports the closed state', toggle?.props?.['aria-expanded'] === false,
+  JSON.stringify(toggle?.props?.['aria-expanded']))
+check('the toggle names itself', toggle?.props?.['aria-label'] === '对话记录', String(toggle?.props?.['aria-label']))
+
+console.log('\n== opening the panel lists the conversation in order ==')
+toggle.props.onClick()
+await tick()
+toggle = render(toggleNode)
+check('the toggle reports the open state', toggle?.props?.['aria-expanded'] === true,
+  JSON.stringify(toggle?.props?.['aria-expanded']))
+check('the toggle shows itself as active', toggle?.props?.['data-active'] === 'true',
+  String(toggle?.props?.['data-active']))
+
+render(panelNode)
+await tick()
+let panel = render(panelNode)
+const cardsOf = (tree) => findAll(tree, 'div')
+  .filter((node) => String(node.props?.className ?? '').includes('dsh-chat-git-card'))
+check('the panel read the conversation timeline',
+  requests.some((entry) => entry.url === '/chat-git/timeline' && entry.body.sessionId === 'session-live-1'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/timeline').map((entry) => entry.body)))
+const cards = cardsOf(panel)
+check('one card per turn, in order', cards.length === 3, String(cards.length))
+const panelText = textOf(panel)
+check('a card names its turn', panelText.includes('第 1 轮'), JSON.stringify(panelText.slice(0, 160)))
+check('the cards keep the conversation order',
+  panelText.indexOf('实现登录接口') < panelText.indexOf('把登录返回值改成 ok'),
+  JSON.stringify(panelText.slice(0, 300)))
+check('a card shows the checkpoint it produced', panelText.includes('aaaa111'),
+  JSON.stringify(panelText.slice(0, 300)))
+check('a turn with no checkpoint says so', panelText.includes('没有产生提交'),
+  JSON.stringify(panelText.slice(0, 400)))
+check('the panel counts the turns', panelText.includes('3 轮'), JSON.stringify(panelText.slice(0, 120)))
+
+console.log('\n== each card offers both branch actions ==')
+check('every card carries exactly the two buttons',
+  cards.every((card) => findAll(card, 'button').length === 2),
+  JSON.stringify(cards.map((card) => findAll(card, 'button').length)))
+check('the buttons are labelled as asked',
+  findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|') === '从这里 fork|回退到这里',
+  findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|'))
+check('a turn with no closing sequence cannot branch',
+  findAll(cards[2], 'button').every((btn) => btn.props?.disabled === true),
+  JSON.stringify(findAll(cards[2], 'button').map((btn) => btn.props?.disabled)))
+check('the panel explains why that turn cannot branch',
+  panelText.includes('没有结束序列'), JSON.stringify(panelText.slice(-200)))
+
+console.log('\n== the dialog asks what to do with the code ==')
+findAll(cards[1], 'button')[0].props.onClick()
+panel = render(panelNode)
+const dialogLabels = findAll(panel, 'button').map((btn) => textOf(btn))
+check('the dialog offers both scopes',
+  dialogLabels.includes('仅回退/fork 对话') && dialogLabels.includes('代码回退/fork'),
+  JSON.stringify(dialogLabels))
+check('the dialog names the turn', textOf(panel).includes('第 2 轮'), JSON.stringify(textOf(panel).slice(-320)))
+check('a fork promises the original survives',
+  textOf(panel).includes('当前会话保持原样'), JSON.stringify(textOf(panel).slice(-320)))
+check('the dialog names the checkpoint the code would return to',
+  textOf(panel).includes('bbbb222'), JSON.stringify(textOf(panel).slice(-320)))
+
+console.log('\n== a conversation-only fork leaves the repository alone ==')
+forkedSessions.length = 0
+archived.length = 0
+const beforeFork = requests.filter((entry) => entry.url === '/chat-git/revert').length
+findAll(panel, 'button').find((btn) => textOf(btn) === '仅回退/fork 对话').props.onClick()
+await tick()
+await tick()
+await tick()
+check('no repository revert was requested',
+  requests.filter((entry) => entry.url === '/chat-git/revert').length === beforeFork,
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/revert').map((entry) => entry.body)))
+check('the fork happens at that turn closing sequence',
+  forkedSessions.length === 1 && forkedSessions[0].atSeq === 20, JSON.stringify(forkedSessions))
+check('the fork inherits the surviving checkpoints',
+  requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.turn === 2),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
+check('a fork leaves the original conversation alone', archived.length === 0, JSON.stringify(archived))
+check('the panel closes once it has acted', render(panelNode) === null)
+
+console.log('\n== rewinding archives the conversation it came from ==')
+toggle = render(toggleNode)
+toggle.props.onClick()
+await tick()
+render(panelNode)
+await tick()
+panel = render(panelNode)
+const rewindCard = cardsOf(panel)[0]
+findAll(rewindCard, 'button')[1].props.onClick()
+panel = render(panelNode)
+check('the rewind dialog says the original will be archived',
+  textOf(panel).includes('归档'), JSON.stringify(textOf(panel).slice(-320)))
+
+forkedSessions.length = 0
+archived.length = 0
+const beforeRewind = requests.filter((entry) => entry.url === '/chat-git/revert').length
+findAll(panel, 'button').find((btn) => textOf(btn) === '代码回退/fork').props.onClick()
+await tick()
+await tick()
+await tick()
+const revertCalls = requests.filter((entry) => entry.url === '/chat-git/revert')
+check('the code scope reverts the repository first',
+  revertCalls.length === beforeRewind + 1 && revertCalls.at(-1)?.body?.sha === 'aaaa1111',
+  JSON.stringify(revertCalls.at(-1)?.body))
+check('the fork still happens at that turn', forkedSessions[0]?.atSeq === 10, JSON.stringify(forkedSessions))
+check('rewinding archives the original conversation',
+  archived.length === 1 && archived[0] === 'session-live-1', JSON.stringify(archived))
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

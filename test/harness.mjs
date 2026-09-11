@@ -209,6 +209,20 @@ let llmMode = 'title'
 let llmTitle = '修复设置页开关无法启用'
 
 const llmStub = {
+  /** Two providers, the second of which never answers, so the deadline is real. */
+  listProviders() {
+    return [
+      { id: 'fake-provider', name: 'Fake Provider' },
+      { id: 'slow-provider', name: 'Slow Provider' },
+    ]
+  },
+  async listModels(provider) {
+    if (provider === 'slow-provider') return new Promise(() => {})
+    return [
+      { provider, id: 'fake-model', name: 'Fake Model' },
+      { provider, id: 'tiny-model', name: 'Tiny Model' },
+    ]
+  },
   async *stream(options) {
     llmCalls.push(options)
     if (llmMode === 'throw') throw new Error('provider unreachable')
@@ -262,6 +276,24 @@ check('includes the changed files when present',
   buildSummaryInput('修复开关', 'M\tlib/index.js').includes('lib/index.js'))
 check('omits the file section when there is none',
   !buildSummaryInput('修复开关', '').includes('本轮改动文件'))
+
+console.log('\n== a 0.2 state file migrates to the three-way preference ==')
+const { createStore } = await import(new URL('../lib/store.js', import.meta.url).href)
+/** Write a legacy state file and read it back through the store. */
+function migratedState(legacy) {
+  const file = join(home, `legacy-${String(Object.keys(legacy).length)}-${String(legacy.summarize)}.json`)
+  writeFileSync(file, JSON.stringify({ version: 1, enabled: true, sessions: {}, ...legacy }), 'utf8')
+  return createStore(file).summary
+}
+check('a legacy summarize:false becomes the off mode',
+  migratedState({ summarize: false }).mode === 'off', JSON.stringify(migratedState({ summarize: false })))
+check('a legacy summarize:true becomes the current mode',
+  migratedState({ summarize: true }).mode === 'current', JSON.stringify(migratedState({ summarize: true })))
+check('a state file with no preference at all defaults to current',
+  migratedState({}).mode === 'current', JSON.stringify(migratedState({})))
+check('a corrupt preference degrades to the default',
+  migratedState({ summary: { mode: 'nonsense' } }).mode === 'current',
+  JSON.stringify(migratedState({ summary: { mode: 'nonsense' } })))
 
 const ctx = createContext()
 apply(ctx)
@@ -545,32 +577,110 @@ try {
   check('the capped subject keeps the marker', cappedSubject.startsWith('Ai-coding：'), JSON.stringify(cappedSubject))
   llmTitle = '修复设置页开关无法启用'
 
-  console.log('\n== the summary switch ==')
-  const offSummary = await call(aiServer.base, '/chat-git/set-summarize', { summarize: false })
-  check('the summary switch can be turned off',
-    offSummary.ok === true && offSummary.value.summarize === false, JSON.stringify(offSummary))
+  console.log('\n== the summary preference: off ==')
+  const offSummary = await call(aiServer.base, '/chat-git/set-summary', { mode: 'off' })
+  check('the preference can be turned off',
+    offSummary.ok === true && offSummary.value.summary.mode === 'off', JSON.stringify(offSummary))
   const callsBefore = llmCalls.length
   writeFileSync(join(ai, 'fifth.js'), 'export const fifth = 5\n', 'utf8')
   await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 5, '第五个导出'))
   await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 5))
-  check('no model call is made while the summary switch is off',
+  check('no model call is made while the preference is off',
     llmCalls.length === callsBefore, `${String(llmCalls.length - callsBefore)} extra call(s)`)
   check('the subject comes straight from the prompt',
     git(ai, ['log', '-1', '--format=%s']).out === 'Ai-coding：第五个导出',
     git(ai, ['log', '-1', '--format=%s']).out)
-  const onSummary = await call(aiServer.base, '/chat-git/set-summarize', { summarize: true })
-  check('the summary switch can be turned back on',
-    onSummary.ok === true && onSummary.value.summarize === true, JSON.stringify(onSummary))
-  const summaryState = (await call(aiServer.base, '/chat-git/state', { sessionId: '' })).value
-  check('the global read reports the summary preference', summaryState?.summarize === true,
-    JSON.stringify(summaryState?.summarize))
+
+  console.log('\n== the summary preference: a configured route ==')
+  const custom = await call(aiServer.base, '/chat-git/set-summary',
+    { mode: 'custom', provider: 'other-provider', model: 'tiny-model' })
+  check('a custom route is accepted',
+    custom.ok === true && custom.value.summary.mode === 'custom', JSON.stringify(custom))
+  writeFileSync(join(ai, 'sixth.js'), 'export const sixth = 6\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 6, '第六个导出'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 6))
+  const customCall = llmCalls.at(-1)
+  check('the model was asked on the configured route',
+    customCall?.provider === 'other-provider' && customCall?.model === 'tiny-model',
+    JSON.stringify({ provider: customCall?.provider, model: customCall?.model }))
+
+  console.log('\n== the summary preference: the conversation route ==')
+  const backToCurrent = await call(aiServer.base, '/chat-git/set-summary', { mode: 'current' })
+  check('the current mode is accepted',
+    backToCurrent.ok === true && backToCurrent.value.summary.mode === 'current', JSON.stringify(backToCurrent))
+  // The agent's own frozen route must win over the default selection: "current"
+  // means the model this conversation is actually talking to.
+  const routeAgent = {
+    session: { header: { id: 'session-route', cwd: ai } },
+    options: { provider: 'session-provider', model: 'session-model' },
+  }
+  writeFileSync(join(ai, 'seventh.js'), 'export const seventh = 7\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', {
+    agent: routeAgent,
+    message: { content: [{ type: 'text', text: '走会话自身的路由' }] },
+    turn: 1,
+  })
+  await aiCtx.emit('agent/turn-stopping', { agent: routeAgent, turn: 1 })
+  const routeCall = llmCalls.at(-1)
+  check('the conversation route is preferred over the default',
+    routeCall?.provider === 'session-provider' && routeCall?.model === 'session-model',
+    JSON.stringify({ provider: routeCall?.provider, model: routeCall?.model }))
+  check('the conversation-mode subject still carries the marker',
+    git(ai, ['log', '-1', '--format=%s']).out === 'Ai-coding：修复设置页开关无法启用',
+    git(ai, ['log', '-1', '--format=%s']).out)
+
+  console.log('\n== an unusable summary preference is refused ==')
+  const incomplete = await call(aiServer.base, '/chat-git/set-summary',
+    { mode: 'custom', provider: 'other-provider', model: '' })
+  check('custom with an empty model is refused',
+    incomplete.ok === false && incomplete.error.code === 'bad-preference', JSON.stringify(incomplete))
+  // A patch that names only the mode keeps whatever route is already stored, so
+  // the refusal case is an explicitly emptied route, not an omitted one.
+  const noRoute = await call(aiServer.base, '/chat-git/set-summary',
+    { mode: 'custom', provider: '', model: '' })
+  check('custom with an emptied route is refused',
+    noRoute.ok === false && noRoute.error.code === 'bad-preference', JSON.stringify(noRoute))
+  const badMode = await call(aiServer.base, '/chat-git/set-summary', { mode: 'whenever' })
+  check('an unknown mode is refused',
+    badMode.ok === false && badMode.error.code === 'bad-preference', JSON.stringify(badMode))
+  const keptMode = (await call(aiServer.base, '/chat-git/state', { sessionId: '' })).value?.summary
+  check('a refused patch leaves the stored preference untouched',
+    keptMode?.mode === 'current', JSON.stringify(keptMode))
+
+  console.log('\n== the model catalogue behind the picker ==')
+  // This call also proves the per-provider deadline: the stub's second provider
+  // never settles, so the answer can only arrive if the bound is enforced.
+  const startedCatalogue = Date.now()
+  const models = (await call(aiServer.base, '/chat-git/models', {})).value
+  const catalogueMs = Date.now() - startedCatalogue
+  check('the catalogue lists every registered provider',
+    Array.isArray(models?.providers) && models.providers.length === 2,
+    JSON.stringify(models?.providers?.map((entry) => entry.id)))
+  check('a provider that answers lists its models',
+    models.providers.find((entry) => entry.id === 'fake-provider')?.models.length === 2,
+    JSON.stringify(models.providers.find((entry) => entry.id === 'fake-provider')?.models))
+  check('a provider that never answers degrades to an empty model list',
+    models.providers.find((entry) => entry.id === 'slow-provider')?.models.length === 0,
+    JSON.stringify(models.providers.find((entry) => entry.id === 'slow-provider')?.models))
+  check('the stalled provider does not hold up the answer',
+    catalogueMs < 8000, `${String(catalogueMs)}ms`)
+  check('the catalogue reports the route current would use',
+    models?.current?.provider === 'fake-provider', JSON.stringify(models?.current))
+  check('the catalogue reports the stored preference',
+    models?.configured?.mode === 'current', JSON.stringify(models?.configured))
+  const cachedCatalogue = Date.now()
+  await call(aiServer.base, '/chat-git/models', {})
+  check('the catalogue is cached rather than re-probed each time',
+    Date.now() - cachedCatalogue < 1000, `${String(Date.now() - cachedCatalogue)}ms`)
 
   console.log('\n== an absent model layer never costs a checkpoint ==')
   // No `llm` and no model route: the whole AI path must be skipped, not fatal.
   const bare = createContext()
   apply(bare)
   const bareServer = await serve(bare)
-  writeFileSync(join(ai, 'sixth.js'), 'export const sixth = 6\n', 'utf8')
+  // A distinct path and distinct content: reusing a file an earlier turn already
+  // committed would leave the tree clean and silently skip the checkpoint.
+  writeFileSync(join(ai, 'eighth.js'), 'export const eighth = 8\n', 'utf8')
   await bare.emit('agent/inbox/claimed', claim('session-bare', ai, 1, '没有模型服务时仍然要提交'))
   await bare.emit('agent/turn-stopping', stop('session-bare', ai, 1))
   check('the checkpoint is written without any llm service',

@@ -174,6 +174,15 @@ globalThis.document = {
 /** Requests the client made, for asserting the host contract it depends on. */
 const requests = []
 
+/**
+ * The preference the fake host currently holds.
+ *
+ * Keeping it here is what makes partial patches faithful: the real host merges
+ * a patch into the stored object, so a stub that rebuilt the preference from
+ * the request body alone would reject patches the host accepts.
+ */
+let storedSummary = { mode: 'current', provider: '', model: '' }
+
 /** Host answers for the routes the client half needs. */
 globalThis.fetch = async (url, init) => {
   const body = init === undefined ? {} : JSON.parse(init.body)
@@ -189,7 +198,7 @@ globalThis.fetch = async (url, init) => {
       ok: true,
       value: {
         enabled: true,
-        summarize: true,
+        summary: { ...storedSummary },
         committed: true,
         stateFile: 'C:/tmp/chat-git.json',
         cwd: scoped ? 'C:/ws' : '',
@@ -202,8 +211,41 @@ globalThis.fetch = async (url, init) => {
           : [],
       },
     }
-  } else if (url === '/chat-git/set-summarize') {
-    payload = { ok: true, value: { summarize: body.summarize } }
+  } else if (url === '/chat-git/models') {
+    payload = {
+      ok: true,
+      value: {
+        providers: [
+          {
+            id: 'deepseek-official',
+            name: 'DeepSeek',
+            models: [
+              { id: 'deepseek-v4-flash', name: 'V4 Flash' },
+              { id: 'deepseek-v4-pro', name: 'V4 Pro' },
+            ],
+          },
+          { id: 'bare-provider', name: 'Bare', models: [] },
+        ],
+        current: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+        configured: { ...storedSummary },
+      },
+    }
+  } else if (url === '/chat-git/set-summary') {
+    // Mirrors the host: the patch merges into the stored preference, the reply
+    // is the whole object, and a custom mode with no route is refused.
+    const next = { ...storedSummary }
+    if (typeof body.mode === 'string') next.mode = body.mode
+    if (typeof body.provider === 'string') next.provider = body.provider
+    if (typeof body.model === 'string') next.model = body.model
+    if (next.mode === 'custom' && (next.provider === '' || next.model === '')) {
+      payload = {
+        ok: false,
+        error: { code: 'bad-preference', message: 'a custom summary model needs both a provider and a model' },
+      }
+    } else {
+      storedSummary = next
+      payload = { ok: true, value: { summary: { ...next } } }
+    }
   } else if (url === '/chat-git/revert') {
     payload = { ok: true, value: { restored: body.sha, turn: 1, dropped: 1, removed: ['extra.txt'] } }
   } else if (url === '/chat-git/inherit') {
@@ -491,11 +533,24 @@ check('the switch starts disabled until the host has been read',
   findAll(section, 'button').find((btn) => btn.props?.role === 'switch')?.props?.disabled === true)
 
 const coldSwitches = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')
-check('both preferences render a switch', coldSwitches.length === 2, String(coldSwitches.length))
-check('the summary row explains the model title',
-  coldText.includes('AI 总结提交信息'), JSON.stringify(coldText))
-check('the summary row promises the fallback',
+check('the checkpoint preference renders a switch', coldSwitches.length === 1, String(coldSwitches.length))
+check('the summary card is titled', coldText.includes('AI 总结提交信息'), JSON.stringify(coldText))
+check('the summary card promises the fallback',
   coldText.includes('回退为提示词'), JSON.stringify(coldText))
+
+const coldModes = findAll(section, 'button').filter((btn) => btn.props?.role === 'radio')
+check('the summary model offers three modes', coldModes.length === 3, String(coldModes.length))
+check('the three modes are the expected ones',
+  coldModes.map((btn) => textOf(btn)).join('|') === '关闭|使用当前模型|指定模型',
+  coldModes.map((btn) => textOf(btn)).join('|'))
+check('the default mode shows as selected before the host is read',
+  JSON.stringify(coldModes.map((btn) => btn.props?.['aria-checked'])) === '[false,true,false]',
+  JSON.stringify(coldModes.map((btn) => btn.props?.['aria-checked'])))
+check('the modes cannot be clicked before the host has been read',
+  coldModes.every((btn) => btn.props?.disabled === true),
+  JSON.stringify(coldModes.map((btn) => btn.props?.disabled)))
+check('the pickers are hidden while the mode is not custom',
+  findAll(section, 'select').length === 0, String(findAll(section, 'select').length))
 
 // The probe result arrives asynchronously; re-rendering with the same element
 // reads the state the promise already wrote.
@@ -514,24 +569,72 @@ check('the switch renders as on once the host reported the preference on',
 check('the switch is enabled once the host has been read', warmSwitch?.props?.disabled === false,
   String(warmSwitch?.props?.disabled))
 
-const warmSwitches = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')
-check('the summary switch is labelled', warmSwitches[1]?.props?.['aria-label'] === 'AI 总结提交信息',
-  String(warmSwitches[1]?.props?.['aria-label']))
-check('the summary switch reflects the host preference',
-  warmSwitches[1]?.props?.['aria-checked'] === true, JSON.stringify(warmSwitches[1]?.props?.['aria-checked']))
-check('the summary switch is enabled once the host has been read',
-  warmSwitches[1]?.props?.disabled === false, String(warmSwitches[1]?.props?.disabled))
+const warmModes = findAll(section, 'button').filter((btn) => btn.props?.role === 'radio')
+check('the stored mode is the selected one', warmModes[1]?.props?.['aria-checked'] === true,
+  JSON.stringify(warmModes.map((btn) => btn.props?.['aria-checked'])))
+check('the modes are enabled once the host has been read',
+  warmModes.every((btn) => btn.props?.disabled === false),
+  JSON.stringify(warmModes.map((btn) => btn.props?.disabled)))
+check('the current mode names the concrete route',
+  warmText.includes('deepseek-official / deepseek-v4-flash'), JSON.stringify(warmText))
+check('the model catalogue was read from the host',
+  requests.some((entry) => entry.url === '/chat-git/models'),
+  JSON.stringify(requests.map((entry) => entry.url)))
 
-// Flipping the summary switch must reach the host under its own field, or the
-// two preferences would write over each other.
-warmSwitches[1].props.onClick()
+console.log('\n== choosing a summary model ==')
+// Selecting the custom mode must carry a usable route in the same patch: the
+// host refuses a custom mode with no route, so sending the mode alone would
+// answer the click with an error.
+warmModes[2].props.onClick()
 await tick()
-const summaryCall = requests.find((entry) => entry.url === '/chat-git/set-summarize')
-check('the summary switch posts its own preference field',
-  summaryCall?.body?.summarize === false, JSON.stringify(summaryCall?.body))
-check('the summary switch does not touch the checkpoint preference',
+const customCall = requests.find((entry) => entry.url === '/chat-git/set-summary')
+check('choosing the custom mode sends a complete route',
+  customCall?.body?.mode === 'custom'
+  && customCall?.body?.provider === 'deepseek-official'
+  && customCall?.body?.model === 'deepseek-v4-flash',
+  JSON.stringify(customCall?.body))
+check('choosing a mode never touches the checkpoint preference',
   !requests.some((entry) => entry.url === '/chat-git/set-enabled'),
   JSON.stringify(requests.filter((entry) => entry.url.startsWith('/chat-git/set')).map((entry) => entry.url)))
+
+section = render(sectionNode)
+const customText = textOf(section)
+const pickers = findAll(section, 'select')
+check('the custom mode reveals both pickers', pickers.length === 2, String(pickers.length))
+check('the provider picker lists the registered providers',
+  pickers[0]?.props?.children?.length === 2, String(pickers[0]?.props?.children?.length))
+check('a provider with no registered model is not offered',
+  !(pickers[0]?.props?.children ?? []).some((option) => option?.props?.value === 'bare-provider'),
+  JSON.stringify((pickers[0]?.props?.children ?? []).map((option) => option?.props?.value)))
+check('the model picker lists that provider models',
+  pickers[1]?.props?.children?.length === 3, String(pickers[1]?.props?.children?.length))
+check('the picker reflects the stored route',
+  pickers[0]?.props?.value === 'deepseek-official' && pickers[1]?.props?.value === 'deepseek-v4-flash',
+  JSON.stringify({ provider: pickers[0]?.props?.value, model: pickers[1]?.props?.value }))
+check('the custom pickers explain where the list comes from',
+  customText.includes('已注册的模型路由'), JSON.stringify(customText))
+
+// Changing the model alone must keep the already chosen provider.
+findAll(section, 'select')[1].props.onChange({ target: { value: 'deepseek-v4-pro' } })
+await tick()
+const modelCall = requests.filter((entry) => entry.url === '/chat-git/set-summary').at(-1)
+check('choosing a model sends that model on the custom mode',
+  modelCall?.body?.mode === 'custom' && modelCall?.body?.model === 'deepseek-v4-pro',
+  JSON.stringify(modelCall?.body))
+check('choosing a model does not restate the provider',
+  modelCall?.body?.provider === undefined, JSON.stringify(modelCall?.body))
+
+// A route the registry no longer lists must stay selectable, or simply opening
+// this page would quietly make the user's configuration unreachable.
+findAll(section, 'select')[1].props.onChange({ target: { value: 'retired-model' } })
+await tick()
+section = render(sectionNode)
+const retiredPicker = findAll(section, 'select')[1]
+check('a stored model the registry no longer lists stays selectable',
+  (retiredPicker?.props?.children ?? []).some((option) => option?.props?.value === 'retired-model'),
+  JSON.stringify((retiredPicker?.props?.children ?? []).map((option) => option?.props?.value)))
+check('the stored model is the selected one', retiredPicker?.props?.value === 'retired-model',
+  String(retiredPicker?.props?.value))
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

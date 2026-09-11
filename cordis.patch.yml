@@ -1,0 +1,13 @@
+# dsh-chat-git bundle patch: inserts the dual-face plugin row into the web
+# profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
+# manifest field) over dsh-base; activate with
+#
+#   dsh plugin --profile web add link:E:/Porject/My_project/DsChatGit
+#
+# The row is a bare plugin by package name: the node half (exports ".") runs in
+# the host process (session git checkpoints + /chat-git/* HTTP routes), and the
+# dsh.client declaration in package.json makes the browser half (exports
+# "./client") load in the web GUI.
+- insert:
+    - id: chat-git
+      name: dsh-chat-git

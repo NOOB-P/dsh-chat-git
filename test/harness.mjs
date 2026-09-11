@@ -123,8 +123,12 @@ function createSubprocess() {
   }
 }
 
-/** A minimal Cordis context: listener table, effect passthrough, route capture. */
-function createContext() {
+/**
+ * A minimal Cordis context: listener table, effect passthrough, route capture.
+ * @param services - optional-service table behind `ctx.get`; an absent entry is
+ * `undefined`, exactly as an unmounted service reads in the real host.
+ */
+function createContext(services = {}) {
   const listeners = new Map()
   const disposers = []
   const context = {
@@ -137,6 +141,10 @@ function createContext() {
     },
     logger: { info() {}, warn() {}, error() {} },
     route: null,
+    /** The optional-service lookup the plugin probes for `llm` and the model route. */
+    get(name) {
+      return services[name]
+    },
     on(name, handler) {
       if (!listeners.has(name)) listeners.set(name, [])
       listeners.get(name).push(handler)
@@ -193,12 +201,67 @@ function stop(sessionId, cwd, turn) {
   return { agent: { session: { header: { id: sessionId, cwd } } }, turn }
 }
 
+/** Calls the plugin made to the model, for asserting what the title prompt carried. */
+const llmCalls = []
+
+/** The fake model's behaviour; the tests swap this to exercise each failure path. */
+let llmMode = 'title'
+let llmTitle = '修复设置页开关无法启用'
+
+const llmStub = {
+  async *stream(options) {
+    llmCalls.push(options)
+    if (llmMode === 'throw') throw new Error('provider unreachable')
+    if (llmMode === 'error') {
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'provider-error' } } }
+      return
+    }
+    yield { type: 'text-delta', index: 0, text: llmTitle }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  },
+}
+
+const modelRouteStub = {
+  currentSelection: () => ({ provider: 'fake-provider', model: 'fake-model', reasoningEffort: 'low' }),
+}
+
 /** The store reads DSH_HOME at apply() time, so the real ~/.dsh is untouched. */
 process.env.DSH_HOME = home
 
 const SESSION = 'session-test-1'
 
 const { apply } = await import(new URL('../lib/index.js', import.meta.url).href)
+const { buildSummaryInput, cleanSummary } = await import(new URL('../lib/summarize.js', import.meta.url).href)
+
+console.log('\n== the title cleaner ==')
+check('strips a wrapping quote pair', cleanSummary('"修复登录接口"') === '修复登录接口',
+  JSON.stringify(cleanSummary('"修复登录接口"')))
+check('strips a label prefix', cleanSummary('标题：修复登录接口') === '修复登录接口',
+  JSON.stringify(cleanSummary('标题：修复登录接口')))
+check('strips an echoed marker', cleanSummary('Ai-coding：修复登录接口') === '修复登录接口',
+  JSON.stringify(cleanSummary('Ai-coding：修复登录接口')))
+check('drops a trailing full stop', cleanSummary('修复登录接口。') === '修复登录接口',
+  JSON.stringify(cleanSummary('修复登录接口。')))
+check('takes only the first non-empty line',
+  cleanSummary('\n\n修复登录接口\n这里是解释文字') === '修复登录接口',
+  JSON.stringify(cleanSummary('\n\n修复登录接口\n这里是解释文字')))
+check('strips a bullet marker', cleanSummary('- 修复登录接口') === '修复登录接口',
+  JSON.stringify(cleanSummary('- 修复登录接口')))
+check('collapses inner whitespace', cleanSummary('修复   登录\n接口') === '修复 登录',
+  JSON.stringify(cleanSummary('修复   登录\n接口')))
+const longTitle = cleanSummary('这是一个被模型写得很长的标题'.repeat(4))
+check('caps an over-long title', longTitle.length <= 40, `${longTitle.length}: ${longTitle}`)
+check('caps it with an ellipsis', longTitle.endsWith('\u2026'), JSON.stringify(longTitle))
+check('returns nothing for empty input', cleanSummary('') === '' && cleanSummary(null) === '')
+check('returns nothing for whitespace only', cleanSummary('   \n  ') === '')
+
+console.log('\n== the title prompt ==')
+check('names the user request', buildSummaryInput('修复开关', '').includes('修复开关'),
+  JSON.stringify(buildSummaryInput('修复开关', '')))
+check('includes the changed files when present',
+  buildSummaryInput('修复开关', 'M\tlib/index.js').includes('lib/index.js'))
+check('omits the file section when there is none',
+  !buildSummaryInput('修复开关', '').includes('本轮改动文件'))
 
 const ctx = createContext()
 apply(ctx)
@@ -416,6 +479,107 @@ try {
   check('the workspace commit stayed inside the workspace',
     git(inner, ['log', '-1', '--format=%s']).out.startsWith('Ai-coding：'),
     git(inner, ['log', '-1', '--format=%s']).out)
+
+  // -------------------------------------------------------------------------
+  // AI commit titles. These run against their own context so the deterministic
+  // fallback exercised above stays covered by the same assertions it had.
+  // -------------------------------------------------------------------------
+  console.log('\n== a model title becomes the commit subject ==')
+  const aiCtx = createContext({ llm: llmStub, agentDefaultModel: modelRouteStub })
+  apply(aiCtx)
+  const aiServer = await serve(aiCtx)
+  const ai = join(sandbox, 'ai')
+  mkdirSync(ai, { recursive: true })
+  await aiCtx.emit('agent/session-start', start('session-ai', ai))
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+
+  writeFileSync(join(ai, 'widget.js'), 'export const widget = 1\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 1, '把设置页的开关修好，并且补一个回归测试'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 1))
+  const aiSubject = git(ai, ['log', '-1', '--format=%s']).out
+  check('the subject is the model title behind the marker',
+    aiSubject === 'Ai-coding：修复设置页开关无法启用', JSON.stringify(aiSubject))
+
+  const firstCall = llmCalls[0]
+  check('the model was asked on the configured route',
+    firstCall?.provider === 'fake-provider' && firstCall?.model === 'fake-model',
+    JSON.stringify({ provider: firstCall?.provider, model: firstCall?.model }))
+  check('the title prompt carried the user request',
+    String(firstCall?.messages?.[0]?.content?.[0]?.text ?? '').includes('把设置页的开关修好'),
+    JSON.stringify(firstCall?.messages?.[0]?.content?.[0]?.text))
+  check('the title prompt carried the files this turn changed',
+    String(firstCall?.messages?.[0]?.content?.[0]?.text ?? '').includes('widget.js'),
+    JSON.stringify(firstCall?.messages?.[0]?.content?.[0]?.text))
+  check('the title prompt attributes the message to this plugin',
+    firstCall?.messages?.[0]?.source?.plugin === 'chat-git',
+    JSON.stringify(firstCall?.messages?.[0]?.source))
+  check('the title call is deterministic', firstCall?.temperature === 0, String(firstCall?.temperature))
+  check('the title call is output-capped', typeof firstCall?.maxTokens === 'number' && firstCall.maxTokens <= 128,
+    String(firstCall?.maxTokens))
+
+  console.log('\n== an unusable model answer falls back to the prompt ==')
+  llmMode = 'error'
+  writeFileSync(join(ai, 'second.js'), 'export const second = 2\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 2, '给第二个组件加上导出'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 2))
+  check('a failed stream still produces the prompt-based subject',
+    git(ai, ['log', '-1', '--format=%s']).out === 'Ai-coding：给第二个组件加上导出',
+    git(ai, ['log', '-1', '--format=%s']).out)
+
+  llmMode = 'throw'
+  writeFileSync(join(ai, 'third.js'), 'export const third = 3\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 3, '补齐第三个导出'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 3))
+  check('a throwing provider still produces the prompt-based subject',
+    git(ai, ['log', '-1', '--format=%s']).out === 'Ai-coding：补齐第三个导出',
+    git(ai, ['log', '-1', '--format=%s']).out)
+
+  llmMode = 'title'
+  llmTitle = '这是一段又长又啰嗦的模型输出'.repeat(4)
+  writeFileSync(join(ai, 'fourth.js'), 'export const fourth = 4\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 4, '第四个导出'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 4))
+  const cappedSubject = git(ai, ['log', '-1', '--format=%s']).out
+  check('an over-long model answer is capped into the subject', cappedSubject.length <= 72,
+    `${cappedSubject.length}: ${cappedSubject}`)
+  check('the capped subject keeps the marker', cappedSubject.startsWith('Ai-coding：'), JSON.stringify(cappedSubject))
+  llmTitle = '修复设置页开关无法启用'
+
+  console.log('\n== the summary switch ==')
+  const offSummary = await call(aiServer.base, '/chat-git/set-summarize', { summarize: false })
+  check('the summary switch can be turned off',
+    offSummary.ok === true && offSummary.value.summarize === false, JSON.stringify(offSummary))
+  const callsBefore = llmCalls.length
+  writeFileSync(join(ai, 'fifth.js'), 'export const fifth = 5\n', 'utf8')
+  await aiCtx.emit('agent/inbox/claimed', claim('session-ai', ai, 5, '第五个导出'))
+  await aiCtx.emit('agent/turn-stopping', stop('session-ai', ai, 5))
+  check('no model call is made while the summary switch is off',
+    llmCalls.length === callsBefore, `${String(llmCalls.length - callsBefore)} extra call(s)`)
+  check('the subject comes straight from the prompt',
+    git(ai, ['log', '-1', '--format=%s']).out === 'Ai-coding：第五个导出',
+    git(ai, ['log', '-1', '--format=%s']).out)
+  const onSummary = await call(aiServer.base, '/chat-git/set-summarize', { summarize: true })
+  check('the summary switch can be turned back on',
+    onSummary.ok === true && onSummary.value.summarize === true, JSON.stringify(onSummary))
+  const summaryState = (await call(aiServer.base, '/chat-git/state', { sessionId: '' })).value
+  check('the global read reports the summary preference', summaryState?.summarize === true,
+    JSON.stringify(summaryState?.summarize))
+
+  console.log('\n== an absent model layer never costs a checkpoint ==')
+  // No `llm` and no model route: the whole AI path must be skipped, not fatal.
+  const bare = createContext()
+  apply(bare)
+  const bareServer = await serve(bare)
+  writeFileSync(join(ai, 'sixth.js'), 'export const sixth = 6\n', 'utf8')
+  await bare.emit('agent/inbox/claimed', claim('session-bare', ai, 1, '没有模型服务时仍然要提交'))
+  await bare.emit('agent/turn-stopping', stop('session-bare', ai, 1))
+  check('the checkpoint is written without any llm service',
+    git(ai, ['log', '-1', '--format=%s']).out === 'Ai-coding：没有模型服务时仍然要提交',
+    git(ai, ['log', '-1', '--format=%s']).out)
+  bare.dispose()
+  await new Promise((resolve) => bareServer.server.close(resolve))
+  aiCtx.dispose()
+  await new Promise((resolve) => aiServer.server.close(resolve))
 } finally {
   if (server !== null) await new Promise((resolve) => server.close(resolve))
   ctx.dispose()

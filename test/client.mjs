@@ -189,6 +189,7 @@ globalThis.fetch = async (url, init) => {
       ok: true,
       value: {
         enabled: true,
+        summarize: true,
         committed: true,
         stateFile: 'C:/tmp/chat-git.json',
         cwd: scoped ? 'C:/ws' : '',
@@ -201,6 +202,8 @@ globalThis.fetch = async (url, init) => {
           : [],
       },
     }
+  } else if (url === '/chat-git/set-summarize') {
+    payload = { ok: true, value: { summarize: body.summarize } }
   } else if (url === '/chat-git/revert') {
     payload = { ok: true, value: { restored: body.sha, turn: 1, dropped: 1, removed: ['extra.txt'] } }
   } else if (url === '/chat-git/inherit') {
@@ -487,6 +490,13 @@ check('the switch is rendered as a switch role',
 check('the switch starts disabled until the host has been read',
   findAll(section, 'button').find((btn) => btn.props?.role === 'switch')?.props?.disabled === true)
 
+const coldSwitches = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')
+check('both preferences render a switch', coldSwitches.length === 2, String(coldSwitches.length))
+check('the summary row explains the model title',
+  coldText.includes('AI 总结提交信息'), JSON.stringify(coldText))
+check('the summary row promises the fallback',
+  coldText.includes('回退为提示词'), JSON.stringify(coldText))
+
 // The probe result arrives asynchronously; re-rendering with the same element
 // reads the state the promise already wrote.
 await tick()
@@ -503,6 +513,25 @@ check('the switch renders as on once the host reported the preference on',
   warmSwitch?.props?.['aria-checked'] === true, JSON.stringify(warmSwitch?.props?.['aria-checked']))
 check('the switch is enabled once the host has been read', warmSwitch?.props?.disabled === false,
   String(warmSwitch?.props?.disabled))
+
+const warmSwitches = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')
+check('the summary switch is labelled', warmSwitches[1]?.props?.['aria-label'] === 'AI 总结提交信息',
+  String(warmSwitches[1]?.props?.['aria-label']))
+check('the summary switch reflects the host preference',
+  warmSwitches[1]?.props?.['aria-checked'] === true, JSON.stringify(warmSwitches[1]?.props?.['aria-checked']))
+check('the summary switch is enabled once the host has been read',
+  warmSwitches[1]?.props?.disabled === false, String(warmSwitches[1]?.props?.disabled))
+
+// Flipping the summary switch must reach the host under its own field, or the
+// two preferences would write over each other.
+warmSwitches[1].props.onClick()
+await tick()
+const summaryCall = requests.find((entry) => entry.url === '/chat-git/set-summarize')
+check('the summary switch posts its own preference field',
+  summaryCall?.body?.summarize === false, JSON.stringify(summaryCall?.body))
+check('the summary switch does not touch the checkpoint preference',
+  !requests.some((entry) => entry.url === '/chat-git/set-enabled'),
+  JSON.stringify(requests.filter((entry) => entry.url.startsWith('/chat-git/set')).map((entry) => entry.url)))
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

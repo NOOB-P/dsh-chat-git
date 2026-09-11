@@ -3,16 +3,16 @@
  *
  * The client bundle cannot be run in a browser from here, but everything that
  * decides *what the shell does* can be checked in Node: the
- * `window.__ModuleLoader__` wrapper shape, the exported plugin surface, the
- * three slot registrations, the synchronous chain selector's cold/warm
- * behaviour, and the rendered output of both visible seats.
+ * `window.__ModuleLoader__` wrapper shape, the exported plugin surface, the two
+ * slot registrations, the restore-into-the-icon-row wiring, the message→turn
+ * resolution, the revert flow, and the rendered output of both seats.
  *
  *   node test/client.mjs
  *
  * The renderer below is a deliberately small React stand-in — function
- * components are expanded recursively and `useState` persists across renders,
- * which is enough to observe the settings page go from "not probed yet" to a
- * detected version without a browser.
+ * components are expanded recursively and `useState` persists across renders —
+ * which is enough to drive the two-step confirm and observe the settings page
+ * go from "not probed yet" to a detected version without a browser.
  */
 
 let failures = 0
@@ -38,6 +38,16 @@ const hookStore = new WeakMap()
 let currentComponent = null
 let hookCursor = 0
 
+/** Shallow dependency comparison, as React performs it. */
+function sameDeps(previous, next) {
+  if (previous === undefined || next === undefined) return false
+  if (previous.length !== next.length) return false
+  for (let index = 0; index < previous.length; index += 1) {
+    if (!Object.is(previous[index], next[index])) return false
+  }
+  return true
+}
+
 const ReactStub = {
   createElement(type, props, ...children) {
     return {
@@ -56,18 +66,33 @@ const ReactStub = {
     }
     return [store[index], setter]
   },
-  useEffect(fn) {
+  /**
+   * Deps-aware, because a stub that re-runs effects on every render would reset
+   * the button's armed state on every render and make the two-step confirm
+   * impossible to exercise — the very behaviour under test.
+   */
+  useEffect(fn, deps) {
+    const store = hookStore.get(currentComponent) ?? []
+    const index = hookCursor++
+    const previous = store[index]
+    if (previous !== undefined && sameDeps(previous, deps)) return undefined
+    store[index] = deps === undefined ? [] : [...deps]
+    hookStore.set(currentComponent, store)
     return fn()
   },
-  useCallback(fn) {
+  /** Memoized by deps, so a stable callback does not re-trigger its effect. */
+  useCallback(fn, deps) {
+    const store = hookStore.get(currentComponent) ?? []
+    const index = hookCursor++
+    const previous = store[index]
+    if (previous !== undefined && sameDeps(previous.deps, deps)) return previous.fn
+    store[index] = { fn, deps }
+    hookStore.set(currentComponent, store)
     return fn
   },
 }
 
-/**
- * Expand a tree of elements into host elements, invoking function components
- * and giving each one a fresh hook cursor.
- */
+/** Expand a tree of elements into host elements, invoking function components. */
 function render(node) {
   if (node === null || node === undefined || typeof node === 'boolean') return null
   if (typeof node === 'string' || typeof node === 'number') return node
@@ -118,6 +143,31 @@ function findAll(node, tag, found = []) {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
 
 // ---------------------------------------------------------------------------
+// A minimal DOM, so the plugin's own stylesheet can be observed
+// ---------------------------------------------------------------------------
+
+/** Elements appended to `document.head`. */
+const styleElements = []
+
+const headStub = {
+  appendChild(element) {
+    element.parentNode = {
+      removeChild: () => {
+        const at = styleElements.indexOf(element)
+        if (at >= 0) styleElements.splice(at, 1)
+      },
+    }
+    styleElements.push(element)
+  },
+}
+
+globalThis.document = {
+  head: headStub,
+  getElementById: (id) => styleElements.find((element) => element.id === id) ?? null,
+  createElement: (tag) => ({ tag, id: '', textContent: '', parentNode: null }),
+}
+
+// ---------------------------------------------------------------------------
 // The host the client talks to
 // ---------------------------------------------------------------------------
 
@@ -130,18 +180,25 @@ globalThis.fetch = async (url, init) => {
   requests.push({ url, body })
   let payload
   if (url === '/chat-git/state') {
+    // The host serves a session read and the settings page's global read
+    // through the same route. Mirroring that split here is what keeps this
+    // stub honest: an empty sessionId carries no checkpoints and no workspace
+    // root, and a stub that returned both anyway once hid a settings bug.
+    const scoped = typeof body.sessionId === 'string' && body.sessionId !== ''
     payload = {
       ok: true,
       value: {
         enabled: true,
         committed: true,
         stateFile: 'C:/tmp/chat-git.json',
-        cwd: 'C:/ws',
+        cwd: scoped ? 'C:/ws' : '',
         git: { available: true, version: 'git version 2.54.0.windows.1', error: '' },
-        commits: [
-          { sha: 'aaaa1111', short: 'aaaa111', subject: 'Ai-coding：实现登录接口', turn: 1, at: 2 },
-          { sha: 'bbbb2222', short: 'bbbb222', subject: 'Ai-coding：把登录返回值改成 ok', turn: 2, at: 3 },
-        ],
+        commits: scoped
+          ? [
+            { sha: 'aaaa1111', short: 'aaaa111', subject: 'Ai-coding：实现登录接口', turn: 1, at: 2 },
+            { sha: 'bbbb2222', short: 'bbbb222', subject: 'Ai-coding：把登录返回值改成 ok', turn: 2, at: 3 },
+          ]
+          : [],
       },
     }
   } else if (url === '/chat-git/revert') {
@@ -176,6 +233,8 @@ check('the wrapper exposes a factory', typeof registered?.factory === 'function'
 
 const requireStub = (name) => {
   if (name === 'react') return ReactStub
+  // The shell primitives are absent in this environment; the bundle must cope.
+  if (name === '@deepseek-ai/dsh-client-ui-primitives') throw new Error('not installed')
   throw new Error(`unexpected require: ${name}`)
 }
 
@@ -196,8 +255,19 @@ check('the download target is the official git page',
 /** One captured `slots.register` call, tagged with the slot it went into. */
 const registrations = []
 
+/** Disposers the plugin registered through `ctx.effect`. */
+const effects = []
+
+const forkedSessions = []
+
 const ctx = {
-  sessions: { fork: async () => 'session-fork-9', open: () => {} },
+  sessions: {
+    fork: async ({ sessionId, atSeq }) => {
+      forkedSessions.push({ sessionId, atSeq })
+      return 'session-fork-9'
+    },
+    open: () => {},
+  },
   slots: {
     inject(name, callback) {
       registrations.push({ injectName: name, pending: true })
@@ -217,7 +287,9 @@ const ctx = {
     },
   },
   effect(fn) {
-    return fn()
+    const disposer = fn()
+    if (typeof disposer === 'function') effects.push(disposer)
+    return disposer
   },
 }
 
@@ -226,82 +298,166 @@ plugin.apply(ctx)
 console.log('\n== slot registration ==')
 check('every inject callback completed', registrations.every((entry) => entry.pending === false),
   JSON.stringify(registrations.filter((entry) => entry.pending).map((entry) => entry.injectName)))
-check('three seats are registered', registrations.length === 3,
+check('two seats are registered', registrations.length === 2,
   JSON.stringify(registrations.map((entry) => entry.injectName)))
 
-const turnTail = registrations.find((entry) => entry.injectName === 'conversation.chat.turnTail')
-const tracker = registrations.find((entry) => entry.injectName === 'conversation.chat.assistant-actions')
+const actions = registrations.find((entry) => entry.injectName === 'conversation.chat.assistant-actions')
 const settings = registrations.find((entry) => entry.injectName === 'settings.section')
 
-check('the revert button claims the turn tail chain', turnTail !== undefined)
-check('the turn tail entry carries its own id', turnTail?.options?.id === 'chat-git-revert', String(turnTail?.options?.id))
-check('the turn tail entry outranks the sibling entry at -1',
-  typeof turnTail?.options?.priority === 'number' && turnTail.options.priority < -1,
-  String(turnTail?.options?.priority))
-check('the turn tail entry declares a selector', typeof turnTail?.options?.select === 'function')
-check('the tracker rides the additive assistant-actions list', tracker !== undefined)
-check('the tracker declares its own id', tracker?.options?.id === 'chat-git-session-tracker',
-  String(tracker?.options?.id))
-check('the tracker declares no selector, so it competes with nothing',
-  tracker?.options?.select === undefined)
+check('the revert button claims the additive assistant action list', actions !== undefined)
+check('the action list is additive, never a chain',
+  actions?.options?.select === undefined && actions?.options?.priority === undefined,
+  JSON.stringify(actions?.options))
+check('the revert button declares its own id', actions?.options?.id === 'chat-git-revert',
+  String(actions?.options?.id))
+check('the revert button carries a label', actions?.options?.label === '回退仓库和对话',
+  String(actions?.options?.label))
+check('the revert button has an ordering', typeof actions?.options?.order === 'number',
+  String(actions?.options?.order))
 check('the settings page registers a section', settings !== undefined)
 check('the settings section id is chat-git', settings?.options?.id === 'chat-git', String(settings?.options?.id))
 check('the settings section carries a nav label', settings?.options?.label === '对话 Git',
   String(settings?.options?.label))
 
+console.log('\n== the plugin stylesheet ==')
+check('one stylesheet is installed', styleElements.length === 1, String(styleElements.length))
+check('the stylesheet is namespaced to this plugin', styleElements[0]?.id === 'dsh-chat-git-style',
+  String(styleElements[0]?.id))
+check('the stylesheet styles only this plugin classes',
+  String(styleElements[0]?.textContent).includes('.dsh-chat-git-icon')
+  && !String(styleElements[0]?.textContent).includes('body'),
+  String(styleElements[0]?.textContent).slice(0, 60))
+check('a second apply does not double the stylesheet', (() => {
+  const before = styleElements.length
+  plugin.apply(ctx)
+  return styleElements.length === before
+})(), String(styleElements.length))
+
 // ---------------------------------------------------------------------------
-// The synchronous chain selector
+// Message → turn resolution
 // ---------------------------------------------------------------------------
 
-const select = turnTail.options.select
+/** The snapshot the fake `useChat` selector is handed; swapped per scenario. */
+let chatSnapshot = null
 
-console.log('\n== chain selector: cold index ==')
-check('a cold index declines, leaving the sibling entry in place',
-  select({ turn: { turn: 1 }, seq: 10 }) === null, JSON.stringify(select({ turn: { turn: 1 }, seq: 10 })))
-check('a malformed owner declines', select({}) === null)
-check('a non-numeric turn declines', select({ turn: { turn: 'one' }, seq: 1 }) === null)
+const useChatStub = (selector) => selector(chatSnapshot)
 
-console.log('\n== chain selector: warm index ==')
-// Rendering the tracker is what teaches the plugin which session is live and
-// warms the index; this is the real cooperation between the two seats.
-render(ReactStub.createElement(tracker.component, { sessionId: 'session-live-1' }))
-await tick()
+/** Build a snapshot whose turn-tail nodes carry the ids the seat is keyed by. */
+function snapshotWith(entries) {
+  return {
+    nodes: {
+      values: () => entries.map((entry) => ({
+        kind: 'turn-tail',
+        data: {
+          turn: entry.turn,
+          closing: entry.closing === undefined
+            ? { finalNode: { seq: entry.seq, messageId: entry.messageId } }
+            : entry.closing,
+        },
+      })),
+    },
+  }
+}
 
-check('the tracker renders nothing at all',
-  render(ReactStub.createElement(tracker.component, { sessionId: 'session-live-1' })) === null)
-check('the tracker asked the host for this session',
-  requests.some((entry) => entry.url === '/chat-git/state' && entry.body.sessionId === 'session-live-1'),
-  JSON.stringify(requests))
+chatSnapshot = snapshotWith([
+  { turn: 1, seq: 10, messageId: 'msg-1' },
+  { turn: 2, seq: 20, messageId: 'msg-2' },
+])
 
-const claimed = select({ turn: { turn: 1 }, seq: 10 })
-check('a checkpointed turn is claimed', claimed !== null, JSON.stringify(claimed))
-check('the claimed turn number is passed through', claimed?.turn === 1, JSON.stringify(claimed?.turn))
-check('the claimed sequence is passed through', claimed?.seq === 10, JSON.stringify(claimed?.seq))
-check('the checkpoint rides along, so the button needs no fetch',
-  claimed?.commit?.sha === 'aaaa1111', JSON.stringify(claimed?.commit))
-check('a turn with no checkpoint still declines',
-  select({ turn: { turn: 7 }, seq: 70 }) === null, JSON.stringify(select({ turn: { turn: 7 }, seq: 70 })))
+const RevertSeat = actions.component
+
+/** Render the seat for one message id and settle its checkpoint read. */
+async function seatFor(messageId, sessionId = 'session-live-1') {
+  render(ReactStub.createElement(RevertSeat, { sessionId, messageId, useChat: useChatStub }))
+  await tick()
+  return render(ReactStub.createElement(RevertSeat, { sessionId, messageId, useChat: useChatStub }))
+}
+
+console.log('\n== message -> turn resolution ==')
+const unmatched = await seatFor('msg-does-not-exist')
+check('a message that no turn owns renders nothing', unmatched === null, JSON.stringify(unmatched))
+
+const matched = await seatFor('msg-2')
+check('the turn owning the message is claimed', matched !== null)
+check('the seat read this session\'s checkpoints',
+  requests.some((entry) => entry.url === '/chat-git/state' && entry.body.sessionId === 'session-live-1'))
+
+const stateReads = requests.filter((entry) => entry.url === '/chat-git/state'
+  && entry.body.sessionId === 'session-live-1').length
+await seatFor('msg-2')
+check('checkpoint reads are shared per session rather than repeated per button',
+  requests.filter((entry) => entry.url === '/chat-git/state'
+    && entry.body.sessionId === 'session-live-1').length === stateReads,
+  String(requests.filter((entry) => entry.url === '/chat-git/state').length))
+
+chatSnapshot = snapshotWith([{ turn: 5, seq: 50, messageId: 'msg-5', closing: null }])
+const noClosing = await seatFor('msg-5')
+check('a turn tail with no closing assistant message renders nothing', noClosing === null)
+
+chatSnapshot = { nodes: { values: () => [null, { kind: 'assistant-step' }, { kind: 'turn-tail', data: null }] } }
+const junkSnapshot = await seatFor('msg-2')
+check('an unexpected snapshot shape renders nothing instead of throwing', junkSnapshot === null)
+
+chatSnapshot = {}
+check('a snapshot without a node store renders nothing', (await seatFor('msg-2')) === null)
+
+chatSnapshot = snapshotWith([{ turn: 2, seq: 20, messageId: 'msg-2' }])
 
 // ---------------------------------------------------------------------------
 // Rendered output
 // ---------------------------------------------------------------------------
 
-console.log('\n== the revert button renders ==')
-check('nothing renders without a matched checkpoint',
-  render(ReactStub.createElement(turnTail.component, { sessionId: 'session-live-1', matched: null })) === null)
-
-const armed = render(ReactStub.createElement(turnTail.component, {
-  sessionId: 'session-live-1',
-  matched: { turn: 2, seq: 20, commit: { sha: 'bbbb2222', short: 'bbbb222', subject: 'Ai-coding：把登录返回值改成 ok' } },
-}))
-const buttons = findAll(armed, 'button')
-check('one button renders for a checkpointed turn', buttons.length === 1, String(buttons.length))
-check('the button is labelled 撤回', textOf(buttons[0]) === '撤回', JSON.stringify(textOf(buttons[0])))
+console.log('\n== the revert button renders beside copy ==')
+const button = await seatFor('msg-2')
+const buttons = findAll(button, 'button')
+check('exactly one icon button renders for a checkpointed turn', buttons.length === 1, String(buttons.length))
+check('the button matches the shell icon-button size class',
+  String(buttons[0]?.props?.className).includes('dsh-chat-git-icon'), String(buttons[0]?.props?.className))
 check('the button is an explicit button element', buttons[0]?.props?.type === 'button')
-check('the tooltip names the checkpoint commit',
-  String(buttons[0]?.props?.title ?? '').includes('bbbb222'), String(buttons[0]?.props?.title))
-check('the tooltip names the rollback command',
-  String(buttons[0]?.props?.title ?? '').includes('git checkout'), String(buttons[0]?.props?.title))
+check('the button is icon-only, drawn as an inline svg',
+  findAll(button, 'svg').length === 1 && textOf(button).trim() === '', JSON.stringify(textOf(button)))
+check('the tooltip names both the repository and the conversation',
+  buttons[0]?.props?.['aria-label'] === '回退仓库和对话', String(buttons[0]?.props?.['aria-label']))
+check('the native title mirrors the tooltip',
+  buttons[0]?.props?.title === '回退仓库和对话', String(buttons[0]?.props?.title))
+check('the button starts unarmed', buttons[0]?.props?.['data-armed'] === undefined)
+
+console.log('\n== the two-step confirm ==')
+buttons[0].props.onClick()
+const armed = await seatFor('msg-2')
+const armedButton = findAll(armed, 'button')[0]
+check('the first click arms instead of acting', armedButton?.props?.['data-armed'] === 'true',
+  String(armedButton?.props?.['data-armed']))
+check('the armed tooltip asks for confirmation', armedButton?.props?.['aria-label'] === '再点一次确认回退',
+  String(armedButton?.props?.['aria-label']))
+check('the armed state names the checkpoint being restored',
+  textOf(armed).includes('bbbb222'), JSON.stringify(textOf(armed)))
+check('arming alone performs no request',
+  !requests.some((entry) => entry.url === '/chat-git/revert'))
+
+console.log('\n== the revert flow ==')
+armedButton.props.onClick()
+await tick()
+await tick()
+const revertCall = requests.find((entry) => entry.url === '/chat-git/revert')
+check('a confirmed click reverts on the host', revertCall !== undefined, JSON.stringify(requests.map((r) => r.url)))
+check('the revert names the turn\'s checkpoint', revertCall?.body?.sha === 'bbbb2222', JSON.stringify(revertCall?.body))
+check('the revert names the conversation', revertCall?.body?.sessionId === 'session-live-1',
+  JSON.stringify(revertCall?.body))
+check('the conversation is forked at the turn\'s closing sequence',
+  forkedSessions.length === 1 && forkedSessions[0].atSeq === 20, JSON.stringify(forkedSessions))
+check('the fork is told which conversation it came from',
+  forkedSessions[0]?.sessionId === 'session-live-1', JSON.stringify(forkedSessions))
+const inheritCall = requests.find((entry) => entry.url === '/chat-git/inherit')
+check('the surviving checkpoints are handed to the fork', inheritCall !== undefined,
+  JSON.stringify(requests.map((r) => r.url)))
+check('inherit names both sessions and the kept turn',
+  inheritCall?.body?.from === 'session-live-1' && inheritCall?.body?.to === 'session-fork-9'
+  && inheritCall?.body?.turn === 2, JSON.stringify(inheritCall?.body))
+
+// ---------------------------------------------------------------------------
+// Settings page
+// ---------------------------------------------------------------------------
 
 console.log('\n== the settings page renders ==')
 const sectionNode = ReactStub.createElement(settings.component, { close: () => {} })
@@ -326,23 +482,23 @@ check('the download link opens in a new tab',
   links.every((link) => link.props?.target === '_blank' && String(link.props?.rel ?? '').includes('noreferrer')),
   JSON.stringify(links.map((link) => ({ target: link.props?.target, rel: link.props?.rel }))))
 check('the switch is rendered as a switch role',
-  findAll(section, 'button').some((button) => button.props?.role === 'switch'),
-  JSON.stringify(findAll(section, 'button').map((button) => button.props?.role)))
+  findAll(section, 'button').some((btn) => btn.props?.role === 'switch'),
+  JSON.stringify(findAll(section, 'button').map((btn) => btn.props?.role)))
 check('the switch starts disabled until the host has been read',
-  findAll(section, 'button').find((button) => button.props?.role === 'switch')?.props?.disabled === true)
+  findAll(section, 'button').find((btn) => btn.props?.role === 'switch')?.props?.disabled === true)
 
 // The probe result arrives asynchronously; re-rendering with the same element
 // reads the state the promise already wrote.
 await tick()
 section = render(sectionNode)
 const warmText = textOf(section)
-check('the section reported the host read at mount',
-  requests.some((entry) => entry.url === '/chat-git/state'), JSON.stringify(requests.map((entry) => entry.url)))
-check('the detected git version is shown', warmText.includes('已检测到 git version'),
-  JSON.stringify(warmText))
+check('the section read the host without a session',
+  requests.some((entry) => entry.url === '/chat-git/state' && entry.body.sessionId === ''),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/state').map((entry) => entry.body)))
+check('the detected git version is shown', warmText.includes('已检测到 git version'), JSON.stringify(warmText))
 check('the state file path is surfaced', warmText.includes('chat-git.json'), JSON.stringify(warmText))
 check('the persistence note is shown', warmText.includes('磁盘'), JSON.stringify(warmText))
-const warmSwitch = findAll(section, 'button').find((button) => button.props?.role === 'switch')
+const warmSwitch = findAll(section, 'button').find((btn) => btn.props?.role === 'switch')
 check('the switch renders as on once the host reported the preference on',
   warmSwitch?.props?.['aria-checked'] === true, JSON.stringify(warmSwitch?.props?.['aria-checked']))
 check('the switch is enabled once the host has been read', warmSwitch?.props?.disabled === false,

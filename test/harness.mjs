@@ -292,10 +292,28 @@ try {
   check('an unknown sha is refused', unknown.ok === false && unknown.error.code === 'unknown-checkpoint', JSON.stringify(unknown))
   const noSession = await call(base, '/chat-git/revert', { sessionId: 'nope', sha: turn1.sha })
   check('an unknown session is refused', noSession.ok === false && noSession.error.code === 'session-unknown', JSON.stringify(noSession))
-  const noId = await call(base, '/chat-git/state', {})
-  check('state without a sessionId is refused', noId.ok === false && noId.error.code === 'bad-request', JSON.stringify(noId))
   const missingSha = await call(base, '/chat-git/revert', { sessionId: SESSION })
   check('revert without a sha is refused', missingSha.ok === false && missingSha.error.code === 'bad-request', JSON.stringify(missingSha))
+
+  // Regression guard for the settings page: it has no session and reads the
+  // host with an empty id. Refusing that shape left the switch permanently
+  // disabled with a "sessionId is required" error, so this call must stay valid.
+  console.log('\n== the settings page reads the host without a session ==')
+  const settingsState = await call(base, '/chat-git/state', { sessionId: '' })
+  check('an empty sessionId is a valid global read', settingsState.ok === true, JSON.stringify(settingsState))
+  check('the global read reports the preference', settingsState.value?.enabled === true,
+    JSON.stringify(settingsState.value?.enabled))
+  check('the global read reports the state file path',
+    settingsState.value?.stateFile === join(home, 'chat-git.json'), String(settingsState.value?.stateFile))
+  check('the global read probes git', settingsState.value?.git?.available === true,
+    JSON.stringify(settingsState.value?.git))
+  check('the global read carries no checkpoints',
+    Array.isArray(settingsState.value?.commits) && settingsState.value.commits.length === 0,
+    JSON.stringify(settingsState.value?.commits))
+  check('the global read carries no workspace root', settingsState.value?.cwd === '',
+    JSON.stringify(settingsState.value?.cwd))
+  const settingsNoBody = await call(base, '/chat-git/state', {})
+  check('an omitted sessionId behaves like an empty one', settingsNoBody.ok === true, JSON.stringify(settingsNoBody))
 
   console.log('\n== /chat-git/inherit carries checkpoints to a fork ==')
   const inherited = await call(base, '/chat-git/inherit', { from: SESSION, to: 'session-fork-1', turn: 1 })

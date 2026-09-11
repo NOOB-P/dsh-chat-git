@@ -4,7 +4,7 @@
 
 - **对话开始**时检查会话工作目录是否已有 git 仓库，没有则自动 `git init`；
 - **每轮对话结束**（agent 交付完成）自动 `git add -A -- .` + `git commit`，提交信息格式为 `Ai-coding：描述`；
-- 每轮对话下方多出一个**撤回**按钮：点一下进入待确认，再点一下同时回滚**代码**与**对话**；
+- 每轮对话的图标行里多出一个**回退**图标按钮（就在复制按钮旁边）：点一下进入待确认，再点一下同时回滚**代码**与**对话**；
 - 设置里提供**自动检查点开关**、**检测按钮**（执行 `git --version`）和**下载按钮**（跳转 Git 官方页面）。未安装 git 时开关无法开启。
 
 ## 提交信息格式
@@ -42,7 +42,7 @@ dsh plugin --profile web remove dsh-chat-git
 | 半边 | 入口 | 职责 |
 | --- | --- | --- |
 | Host | `lib/index.js`（`exports "."`） | 会话事件钩子、git 命令、`/chat-git` 路由、设置持久化 |
-| Client | `lib/client.js`（`exports "./client"`） | 撤回按钮、会话跟踪、设置页 |
+| Client | `lib/client.js`（`exports "./client"`） | 回退按钮、设置页 |
 
 `lib/` 下的文件**就是源码**，没有构建步骤 —— 客户端半边直接写在
 `window.__ModuleLoader__.load({ id, factory })` 包装格式里（这正是 client-modules
@@ -50,13 +50,15 @@ dsh plugin --profile web remove dsh-chat-git
 Host 半边只 import `node:` 内置模块和同目录兄弟模块：profile 安装会把包软链过去，
 Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖树，所以保持零依赖是刻意的。
 
-### 三个客户端席位
+### 两个客户端席位
 
 | Slot | 类型 | 用途 |
 | --- | --- | --- |
-| `conversation.chat.turnTail` | chain | 撤回按钮。渲染在每轮标准操作行**之前**（兄弟节点，不替换它） |
-| `conversation.chat.assistant-actions` | list | 隐形会话跟踪席位，保持检查点索引预热，不渲染任何像素 |
+| `conversation.chat.assistant-actions` | list | 回退按钮。shell 把它渲染成该回合图标行的 `extraActions`，即**紧跟在复制按钮之后** |
 | `settings.section` | list | 设置页（开关 / 检测 / 下载） |
+
+两个席位都是**纯增量**的 list：不与他人争抢任何 cell，因此本插件不会遮蔽、也不会顶掉
+任何既有 UI。
 
 ## Host 路由
 
@@ -69,19 +71,19 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
 | `POST /chat-git/detect` | 执行 `git --version` |
 | `POST /chat-git/set-enabled` | 切换开关；git 不可用时**拒绝开启** |
 | `POST /chat-git/revert` | `git checkout <sha> -- .` 并清理该检查点之后新增的路径 |
-| `POST /chat-git/inherit` | 撤回分叉后，把剩余检查点交给新会话 |
+| `POST /chat-git/inherit` | 回退分叉后，把剩余检查点交给新会话 |
 
 ## 状态
 
 写在 `$DSH_HOME/chat-git.json`（默认 `~/.dsh/chat-git.json`），内容为开关偏好与
 `sessionId -> { cwd, commits }` 映射。放在磁盘上而非内存里，因此 harness 重启后
-历史对话的撤回按钮依然可用。任何读写失败都降级为仅内存，不会把插件拖垮。
+历史对话的回退按钮依然可用。任何读写失败都降级为仅内存，不会把插件拖垮。
 
 ## 设计边界与取舍
 
 这些是刻意的工程决定，不是未完成项：
 
-1. **撤回用 fork，不销毁会话。** DSH 没有「截断会话」API，只有
+1. **回退用 fork，不销毁会话。** DSH 没有「截断会话」API，只有
    `sessions.fork({ sessionId, atSeq })`。所以「后面的对话全部删除」实现为：
    在该轮结束序列处分叉，得到只含前 N 轮的新会话并切换过去。原始日志保留，
    用户不会因为一次误点永久丢失记录。
@@ -90,7 +92,7 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
    文件会残留、让回溯看起来只做了一半。所以在此之后还会 `git rm` 掉
    `sha..HEAD` 之间**新增**的路径。只动 HEAD 里存在的路径，因此每一步都还能从
    提交历史里找回。HEAD 保持不动，使「轮次 → 检查点」映射继续可读。
-3. **未跟踪文件不碰。** 它们不属于任何检查点，删掉就找不回来了。撤回后它们会
+3. **未跟踪文件不碰。** 它们不属于任何检查点，删掉就找不回来了。回退后它们会
    作为未跟踪文件留在原地。
 4. **已有仓库会被沿用，不会被重新 init。** 只有当会话工作目录**本身就是**一个
    仓库根时才会沿用；仅仅位于某个上层仓库**内部**时，会在工作目录里 `git init`
@@ -98,24 +100,31 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
    两件事共同保证：嵌套仓库本身，以及 `git add -A -- .` 中显式的 pathspec ——
    自 Git 2.0 起，不带 pathspec 的 `git add -A` 会暂存**整个工作树**而与当前目录
    无关，一旦工作区落在更大的仓库内就会把无关改动一起卷进来。
-5. **turnTail 的优先级是 `-5`。** 该 chain 没有默认条目，但 `dsh-better-sidebar`
-   以 `-1` 注册、并且只在「该轮产出了文件」时命中 —— 那恰好也是产生检查点的轮次。
-   本插件的选择器只认领**索引里已有检查点**的轮次，其余一律返回 `null` 交还给兄弟
-   条目；代价是在有检查点的轮次上，better-sidebar 的产出文件行会被让位。
-   若要恢复其优先权，把 `lib/client.js` 里的 `TURN_TAIL_PRIORITY` 调成 `>= -1` 即可
-   （代价是本插件的按钮将只在 better-sidebar 不认领的轮次出现）。
-6. **选择器是同步的。** chain 的 `select` 拿不到 `sessionId`、也不能 await，所以它读
-   一个由跟踪席位预热的同步索引。索引冷时一律 decline —— 这是安全方向：冷索引只会
-   让本插件少出现一个按钮，绝不会抢走别人的席位。
-7. **git 走 `ctx.subprocess` 的 argv 数组**，不是 shell 字符串：没有引号规则要处理、
+5. **按钮落在回合图标行，而不是用户消息那一行。** 用户消息的复制按钮由 shell 的
+   `UserMessageNodeView` 内联渲染，内部**不渲染任何 slot**；`conversation.chat.node`
+   下只声明了 `tool.call.toolview` / `assistant-actions` / `turnTail` / `commandview`
+   四个子席，没有任何用户消息操作位。且 `UserStyleBubble` / `MessageIconActions` 是
+   `dsh-client-ui-chat` 的模块私有符号，`exports` 只暴露 4 个值；所有公开 client 模块
+   （ui-chat 4 个、ui-conversation 13 个、ui-session 3 个）都不提供可复用的气泡组件，
+   `dsh-client-ui-primitives` 在本机安装树里甚至不存在。因此「复制旁边」只能落在
+   回合图标行 —— 那里恰好是 `MessageIconActions` 的 `extraActions`，渲染顺序为
+   `[时间, 复制按钮, extraActions, 分支按钮, …]`，即**紧邻复制按钮**。
+6. **按钮靠 `messageId` 反查轮次。** `assistant-actions` 只派发 `messageId`，而检查点
+   按轮次编号存放，回退还需要分叉边界。轮次号与回合结束序列都从 Chat snapshot 的
+   `turn-tail` 节点上读回（其已声明的载荷同时携带三者），选择器返回 `"turn:seq"`
+   字符串而非对象，以保证取值按值比较稳定、不引发多余渲染。
+7. **`/chat-git/state` 的空 `sessionId` 是合法的全局读。** 设置页没有会话，只读开关、
+   git 探测与状态文件路径。曾经把它当作缺参拒绝，结果设置页永远拿不到 state、开关
+   一直禁用并显示 `sessionId is required` —— 现由 host 与 client 两侧的测试共同看住。
+8. **git 走 `ctx.subprocess` 的 argv 数组**，不是 shell 字符串：没有引号规则要处理、
    提交信息与路径没有注入面，并且与工具调用享有同等的子进程生命周期与输出上限。
 
 ## 验证
 
 ```bash
 npm test              # 两套一起跑
-npm run test:host     # 52 项：真实 git、假 ctx、真实 loopback HTTP
-npm run test:client   # 54 项：包装格式、席位注册、同步选择器、渲染输出
+npm run test:host     # 58 项：真实 git、假 ctx、真实 loopback HTTP
+npm run test:client   # 65 项：包装格式、席位注册、消息→轮次反查、回退流程、渲染输出
 ```
 
 `test/harness.mjs` 用**真实 git 子进程**在一个临时工作区里跑完整链路，并通过真实

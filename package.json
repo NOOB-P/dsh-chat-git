@@ -2,7 +2,7 @@
   "name": "dsh-chat-git",
   "version": "0.1.0",
   "private": true,
-  "description": "DeepSeek Harness plugin: per-conversation git checkpoints — `git init` on a session's first prompt, an automatic commit when each turn ends, and a one-click revert that rolls the conversation and the repository back together.",
+  "description": "DeepSeek Harness plugin: per-conversation git checkpoints — a repository check at conversation start (`git init` when there is none), an `Ai-coding：<description>` commit whenever a turn ends, and a one-click rollback that rewinds the conversation and the repository together.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -16,6 +16,7 @@
   },
   "files": [
     "lib",
+    "test",
     "cordis.patch.yml",
     "README.md"
   ],

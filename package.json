@@ -1,6 +1,6 @@
 {
   "name": "dsh-chat-git",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "description": "DeepSeek Harness plugin: per-conversation git checkpoints — a repository check at conversation start (`git init` when there is none), an `Ai-coding：<description>` commit whenever a turn ends, and a one-click rollback that rewinds the conversation and the repository together.",
   "type": "module",

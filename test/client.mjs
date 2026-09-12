@@ -772,12 +772,22 @@ check('the panel explains why that turn cannot branch',
   panelText.includes('没有结束序列'), JSON.stringify(panelText.slice(-200)))
 
 console.log('\n== the dialog asks what to do with the code ==')
+// The dialog is a child of the panel, so its buttons have to be read out of the
+// dialog node itself: collecting every button in the panel would also pick up
+// the card buttons, whose wording ("从这里 fork" / "回退到这里") legitimately
+// names both verbs and would drown out the assertion.
+const dialogOf = (tree) => findAll(tree, 'div')
+  .find((node) => String(node.props?.className ?? '').includes('dsh-chat-git-dialog'))
 findAll(cards[1], 'button')[0].props.onClick()
 panel = render(panelNode)
-const dialogLabels = findAll(panel, 'button').map((btn) => textOf(btn))
+const dialogLabels = findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))
 check('the dialog offers both scopes',
-  dialogLabels.includes('仅回退/fork 对话') && dialogLabels.includes('代码回退/fork'),
+  dialogLabels.includes('仅 fork 对话') && dialogLabels.includes('fork 并还原代码'),
   JSON.stringify(dialogLabels))
+// A fork dialog that also says 回退 makes the user re-read the card button they
+// just pressed to work out which of the two they are in.
+check('a fork dialog never says 回退',
+  !dialogLabels.some((label) => label.includes('回退')), JSON.stringify(dialogLabels))
 check('the dialog names the turn', textOf(panel).includes('第 2 轮'), JSON.stringify(textOf(panel).slice(-320)))
 check('a fork promises the original survives',
   textOf(panel).includes('当前会话保持原样'), JSON.stringify(textOf(panel).slice(-320)))
@@ -789,7 +799,7 @@ forkedSessions.length = 0
 archived.length = 0
 const beforeFork = requests.filter((entry) => entry.url === '/chat-git/revert').length
 const beforeTimelineReads = requests.filter((entry) => entry.url === '/chat-git/timeline').length
-findAll(panel, 'button').find((btn) => textOf(btn) === '仅回退/fork 对话').props.onClick()
+findAll(panel, 'button').find((btn) => textOf(btn) === '仅 fork 对话').props.onClick()
 await tick()
 await tick()
 await tick()
@@ -818,11 +828,16 @@ findAll(rewindCard, 'button')[1].props.onClick()
 panel = render(panelNode)
 check('the rewind dialog says the original will be archived',
   textOf(panel).includes('归档'), JSON.stringify(textOf(panel).slice(-320)))
+const rewindLabels = findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))
+check('a rewind dialog names only 回退, never fork',
+  rewindLabels.includes('仅回退对话') && rewindLabels.includes('回退并还原代码')
+  && !rewindLabels.some((label) => label.includes('fork')),
+  JSON.stringify(rewindLabels))
 
 forkedSessions.length = 0
 archived.length = 0
 const beforeRewind = requests.filter((entry) => entry.url === '/chat-git/revert').length
-findAll(panel, 'button').find((btn) => textOf(btn) === '代码回退/fork').props.onClick()
+findAll(panel, 'button').find((btn) => textOf(btn) === '回退并还原代码').props.onClick()
 await tick()
 await tick()
 await tick()

@@ -6,8 +6,8 @@
 - **每轮对话结束**（agent 交付完成）自动 `git add -A -- .` + `git commit`，提交信息格式为 `Ai-coding：描述`；
 - 描述默认由**模型总结**：读一遍该轮的提示词与改动文件，写出一句简短标题，取代冗长且被截断的原始提示词；
 - 每轮对话的图标行里多出一个**回退**图标按钮（就在复制按钮旁边）：点一下进入待确认，再点一下同时回滚**代码**与**对话**；
-- 会话标题旁的**对话记录**按钮打开一个左侧面板，按顺序列出当前会话的每一轮；每张卡片可以**从这里 fork** 或**回退到这里**，两者都会弹窗让你选择「仅回退/fork 对话」还是「代码回退/fork」；
-- 设置里提供**自动检查点开关**、**总结模型**（关闭 / 使用当前模型 / 指定模型）、**检测按钮**（执行 `git --version`）和**下载按钮**（跳转 Git 官方页面）。未安装 git 时自动检查点开关无法开启。
+- 会话的标签栏里（**对话** / **轨迹** 旁边）多出一个 **历史** 标签页，按顺序列出当前会话的每一轮；每张卡片可以**从这里 fork** 或**回退到这里**，两者都会弹窗让你选择「仅回退/fork 对话」还是「代码回退/fork」；
+- 设置里提供**自动检查点开关**、**历史标签页开关**、**总结模型**（关闭 / 使用当前模型 / 指定模型）、**检测按钮**（执行 `git --version`）和**下载按钮**（跳转 Git 官方页面）。未安装 git 时自动检查点开关无法开启。
 
 ## 提交信息格式
 
@@ -56,7 +56,7 @@ dsh plugin --profile web remove dsh-chat-git
 | 半边 | 入口 | 职责 |
 | --- | --- | --- |
 | Host | `lib/index.js`（`exports "."`） | 会话事件钩子、git 命令、`/chat-git` 路由、设置持久化 |
-| Client | `lib/client.js`（`exports "./client"`） | 回退按钮、设置页 |
+| Client | `lib/client.js`（`exports "./client"`） | 回退按钮、历史标签页、设置页 |
 
 `lib/` 下的文件**就是源码**，没有构建步骤 —— 客户端半边直接写在
 `window.__ModuleLoader__.load({ id, factory })` 包装格式里（这正是 client-modules
@@ -64,18 +64,22 @@ dsh plugin --profile web remove dsh-chat-git
 Host 半边只 import `node:` 内置模块和同目录兄弟模块：profile 安装会把包软链过去，
 Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖树，所以保持零依赖是刻意的。
 
-### 四个客户端席位
+### 三个客户端席位
 
 | Slot | 类型 | 用途 |
 | --- | --- | --- |
 | `conversation.chat.assistant-actions` | list | 回退按钮。shell 把它渲染成该回合图标行的 `extraActions`，即**紧跟在复制按钮之后** |
-| `conversation.session.header.actions` | list | 会话标题旁的**对话记录**开关（图标） |
-| `shell.overlay` | list | 左侧滑出的**对话记录面板**：按顺序列出每一轮，每张卡片带「从这里 fork」「回退到这里」 |
-| `settings.section` | list | 设置页（自动检查点开关 / 总结模型三态 / 检测 / 下载） |
+| `conversation.view` | list | 标签栏里的**历史**标签页：按顺序列出每一轮，每张卡片带「从这里 fork」「回退到这里」 |
+| `settings.section` | list | 设置页（自动检查点开关 / 历史标签页开关 / 总结模型三态 / 检测 / 下载） |
 
-四个席位都是**纯增量**的 list：不与他人争抢任何 cell，因此本插件不会遮蔽、也不会顶掉
-任何既有 UI。面板用 `shell.overlay` 是因为该层本身是**点击穿透**的（条目自行选择是否
-接收指针事件），所以悬停在上面的面板不会挡住下面的应用。
+三个席位都是**纯增量**的 list：不与他人争抢任何 cell，因此本插件不会遮蔽、也不会顶掉
+任何既有 UI。
+
+历史视图用 `conversation.view` 而不是自绘的浮层，是因为标签栏是**从 slot 本身投影**出来
+的：一个组件无法隐藏自己那一页，唯一能撤下标签的办法是**退出注册表**。因此设置里的开关
+先把偏好写进 host，再镜像到本地 store，由 store 的订阅者注册或注销这一席 —— 标签与开关
+不可能各说各话。这也是为什么开关状态必须持久化到磁盘：`conversation.view` 的注册发生在
+启动期，而不是标签被点开的那一刻。
 
 ## Host 路由
 
@@ -84,9 +88,10 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
 
 | 路由 | 作用 |
 | --- | --- |
-| `POST /chat-git/state` | 两个开关的状态、git 探测结果、该会话的检查点列表 |
+| `POST /chat-git/state` | 两个开关（自动检查点 / 历史标签页）的状态、git 探测结果、该会话的检查点列表 |
 | `POST /chat-git/detect` | 执行 `git --version` |
 | `POST /chat-git/set-enabled` | 切换自动检查点；git 不可用时**拒绝开启** |
+| `POST /chat-git/set-history` | 切换历史标签页；纯展示偏好，**不做任何能力检查** |
 | `POST /chat-git/set-summary` | 局部更新总结偏好（`mode` / `provider` / `model`）；无路由的 `custom` **被拒绝** |
 | `POST /chat-git/timeline` | 折叠该会话的日志，返回按顺序的每一轮（含 fork 边界与对应检查点） |
 | `POST /chat-git/models` | 实时模型目录，供设置页的选择器使用（带 60 秒缓存与每服务商 4 秒上限） |
@@ -102,6 +107,7 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
 {
   "version": 1,
   "enabled": true,
+  "history": true,
   "summary": { "mode": "current", "provider": "", "model": "" },
   "sessions": { "<sessionId>": { "cwd": "...", "commits": [] } }
 }
@@ -170,7 +176,7 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
     provider / model 仍然可选 —— 否则打开一次设置页就会让用户的配置变得不可达。
     模型目录读取带 60 秒缓存，且每个服务商各自 4 秒上限，卡住的服务商只会退化成空
     模型列表，不会拖住整个设置页。
-13. **面板的数据来自会话日志，不来自客户端已渲染的内容。** `Session.snapshotEvents()`
+13. **历史标签页的数据来自会话日志，不来自客户端已渲染的内容。** `Session.snapshotEvents()`
     的日志里 `turn/start` / `user/message` / `turn/end` 齐备，而 `turn/end` 事件自身的
     `seq` 就是 fork 边界。这样读是**权威**的：不取决于聊天视图当前渲染了哪几轮，所以
     早已滚出窗口、甚至本次进程重启前发生的那一轮，同样拿得到可用的边界；代价是读取
@@ -187,7 +193,7 @@ Node 会从真实项目路径向上解析裸模块名，那里并不存在依赖
 ```bash
 npm test              # 两套一起跑
 npm run test:host     # 130 项：真实 git、假 ctx/假模型、日志折叠、真实 loopback HTTP
-npm run test:client   # 124 项：席位注册、消息→轮次反查、回退流程、三态选择器、记录面板
+npm run test:client   # 119 项：席位注册、消息→轮次反查、回退流程、三态选择器、历史标签页
 ```
 
 `test/harness.mjs` 用**真实 git 子进程**在一个临时工作区里跑完整链路，并通过真实

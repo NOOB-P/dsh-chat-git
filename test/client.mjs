@@ -190,6 +190,10 @@ const requests = []
  */
 let storedSummary = { mode: 'current', provider: '', model: '' }
 
+/** The checkpoint master switch and the History-tab preference. */
+let storedEnabled = true
+let storedHistory = true
+
 /** The timeline the fake host serves, including one turn that never closed. */
 let timelineTurns = [
   {
@@ -231,7 +235,10 @@ globalThis.fetch = async (url, init) => {
     payload = {
       ok: true,
       value: {
-        enabled: true,
+        enabled: storedEnabled,
+        // Mirrors the host: the settings page's global read also carries the
+        // History-tab preference, which is what the tab's registration follows.
+        history: storedHistory,
         summary: { ...storedSummary },
         committed: true,
         stateFile: 'C:/tmp/chat-git.json',
@@ -282,6 +289,12 @@ globalThis.fetch = async (url, init) => {
       storedSummary = next
       payload = { ok: true, value: { summary: { ...next } } }
     }
+  } else if (url === '/chat-git/set-enabled') {
+    storedEnabled = body.enabled === true
+    payload = { ok: true, value: { enabled: storedEnabled } }
+  } else if (url === '/chat-git/set-history') {
+    storedHistory = body.history === true
+    payload = { ok: true, value: { history: storedHistory } }
   } else if (url === '/chat-git/revert') {
     payload = { ok: true, value: { restored: body.sha, turn: 1, dropped: 1, removed: ['extra.txt'] } }
   } else if (url === '/chat-git/inherit') {
@@ -373,7 +386,10 @@ const ctx = {
       entry.options = options
       entry.component = component
       entry.pending = false
-      return () => {}
+      entry.disposed = false
+      // A real registry drops the seat when the disposer runs; recording it
+      // here is what lets the tests observe a withdrawn tab.
+      return () => { entry.disposed = true }
     },
   },
   effect(fn) {
@@ -388,7 +404,7 @@ plugin.apply(ctx)
 console.log('\n== slot registration ==')
 check('every inject callback completed', registrations.every((entry) => entry.pending === false),
   JSON.stringify(registrations.filter((entry) => entry.pending).map((entry) => entry.injectName)))
-check('four seats are registered', registrations.length === 4,
+check('three seats are registered, the History tab among them', registrations.length === 3,
   JSON.stringify(registrations.map((entry) => entry.injectName)))
 
 const actions = registrations.find((entry) => entry.injectName === 'conversation.chat.assistant-actions')
@@ -578,7 +594,10 @@ check('the switch starts disabled until the host has been read',
   findAll(section, 'button').find((btn) => btn.props?.role === 'switch')?.props?.disabled === true)
 
 const coldSwitches = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')
-check('the checkpoint preference renders a switch', coldSwitches.length === 1, String(coldSwitches.length))
+check('both preferences render a switch', coldSwitches.length === 2, String(coldSwitches.length))
+check('the two switches are the checkpoint and the History tab',
+  coldSwitches.map((btn) => btn.props?.['aria-label']).join('|') === '自动检查点|历史标签页',
+  coldSwitches.map((btn) => btn.props?.['aria-label']).join('|'))
 check('the summary card is titled', coldText.includes('AI 总结提交信息'), JSON.stringify(coldText))
 check('the summary card promises the fallback',
   coldText.includes('回退为提示词'), JSON.stringify(coldText))
@@ -682,43 +701,26 @@ check('the stored model is the selected one', retiredPicker?.props?.value === 'r
   String(retiredPicker?.props?.value))
 
 // ---------------------------------------------------------------------------
-// The conversation timeline panel
+// The History view, in the tab strip beside 对话 and 轨迹
 // ---------------------------------------------------------------------------
 
-const timelineToggle = registrations.find((entry) => entry.injectName === 'conversation.session.header.actions')
-const timelinePanel = registrations.find((entry) => entry.injectName === 'shell.overlay')
+const conversationTab = registrations.find((entry) => entry.injectName === 'conversation.view')
 
-console.log('\n== the timeline seats ==')
-check('the toggle sits in the session header actions', timelineToggle !== undefined)
-check('the toggle declares its own id', timelineToggle?.options?.id === 'chat-git-timeline',
-  String(timelineToggle?.options?.id))
-check('the panel rides the frame overlay', timelinePanel !== undefined)
-check('the panel declares its own id', timelinePanel?.options?.id === 'chat-git-timeline-panel',
-  String(timelinePanel?.options?.id))
-check('the overlay entry is purely additive',
-  timelinePanel?.options?.select === undefined && timelinePanel?.options?.key === undefined,
-  JSON.stringify(timelinePanel?.options))
+console.log('\n== the History tab ==')
+check('the History view rides the conversation tab strip', conversationTab !== undefined)
+check('the tab declares its own id', conversationTab?.options?.id === 'chat-git-history',
+  String(conversationTab?.options?.id))
+check('the tab is labelled 历史', conversationTab?.options?.label === '历史',
+  String(conversationTab?.options?.label))
+check('the tab has an ordering', typeof conversationTab?.options?.order === 'number',
+  String(conversationTab?.options?.order))
+check('the tab entry is purely additive',
+  conversationTab?.options?.select === undefined && conversationTab?.options?.key === undefined,
+  JSON.stringify(conversationTab?.options))
 
-const toggleNode = ReactStub.createElement(timelineToggle.component, { sessionId: 'session-live-1' })
-const panelNode = ReactStub.createElement(timelinePanel.component, {})
+const panelNode = ReactStub.createElement(conversationTab.component, { sessionId: 'session-live-1' })
 
-console.log('\n== the panel starts closed ==')
-check('the panel renders nothing while closed', render(panelNode) === null)
-let toggle = render(toggleNode)
-check('the toggle is an icon button', findAll(toggle, 'svg').length === 1, String(findAll(toggle, 'svg').length))
-check('the toggle reports the closed state', toggle?.props?.['aria-expanded'] === false,
-  JSON.stringify(toggle?.props?.['aria-expanded']))
-check('the toggle names itself', toggle?.props?.['aria-label'] === '对话记录', String(toggle?.props?.['aria-label']))
-
-console.log('\n== opening the panel lists the conversation in order ==')
-toggle.props.onClick()
-await tick()
-toggle = render(toggleNode)
-check('the toggle reports the open state', toggle?.props?.['aria-expanded'] === true,
-  JSON.stringify(toggle?.props?.['aria-expanded']))
-check('the toggle shows itself as active', toggle?.props?.['data-active'] === 'true',
-  String(toggle?.props?.['data-active']))
-
+console.log('\n== the view lists the conversation in order ==')
 render(panelNode)
 await tick()
 let panel = render(panelNode)
@@ -770,6 +772,7 @@ console.log('\n== a conversation-only fork leaves the repository alone ==')
 forkedSessions.length = 0
 archived.length = 0
 const beforeFork = requests.filter((entry) => entry.url === '/chat-git/revert').length
+const beforeTimelineReads = requests.filter((entry) => entry.url === '/chat-git/timeline').length
 findAll(panel, 'button').find((btn) => textOf(btn) === '仅回退/fork 对话').props.onClick()
 await tick()
 await tick()
@@ -783,14 +786,16 @@ check('the fork inherits the surviving checkpoints',
   requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.turn === 2),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
 check('a fork leaves the original conversation alone', archived.length === 0, JSON.stringify(archived))
-check('the panel closes once it has acted', render(panelNode) === null)
+// A tab has nothing to close: acting on a turn moves the conversation, so the
+// view bumps its revision and re-reads the timeline instead of dismissing
+// itself. The bump is state, so a re-render is what makes the effect run.
+panel = render(panelNode)
+await tick()
+check('the view re-reads the timeline after acting',
+  requests.filter((entry) => entry.url === '/chat-git/timeline').length > beforeTimelineReads,
+  String(requests.filter((entry) => entry.url === '/chat-git/timeline').length))
 
 console.log('\n== rewinding archives the conversation it came from ==')
-toggle = render(toggleNode)
-toggle.props.onClick()
-await tick()
-render(panelNode)
-await tick()
 panel = render(panelNode)
 const rewindCard = cardsOf(panel)[0]
 findAll(rewindCard, 'button')[1].props.onClick()
@@ -812,6 +817,54 @@ check('the code scope reverts the repository first',
 check('the fork still happens at that turn', forkedSessions[0]?.atSeq === 10, JSON.stringify(forkedSessions))
 check('rewinding archives the original conversation',
   archived.length === 1 && archived[0] === 'session-live-1', JSON.stringify(archived))
+
+// ---------------------------------------------------------------------------
+// Withdrawing the History tab
+// ---------------------------------------------------------------------------
+
+console.log('\n== the settings switch withdraws and restores the tab ==')
+// The strip is projected from the registry, so a hidden tab means the seat is
+// gone: clicking the switch must dispose the registration, and clicking it back
+// must put a live seat back. A one-way trip would lose the tab for the rest of
+// the session with no way to recover it.
+section = render(sectionNode)
+const historyToggle = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')[1]
+check('the History switch is the second preference', historyToggle?.props?.['aria-label'] === '历史标签页',
+  String(historyToggle?.props?.['aria-label']))
+const enabledCallsBefore = requests.filter((entry) => entry.url === '/chat-git/set-enabled').length
+historyToggle.props.onClick()
+await tick()
+const historyCalls = requests.filter((entry) => entry.url === '/chat-git/set-history')
+check('turning the tab off tells the host the field the route reads',
+  historyCalls.at(-1)?.body?.history === false, JSON.stringify(historyCalls.at(-1)?.body))
+check('turning the tab off withdraws the seat', conversationTab?.disposed === true,
+  String(conversationTab?.disposed))
+check('withdrawing the tab never touches the checkpoint preference',
+  requests.filter((entry) => entry.url === '/chat-git/set-enabled').length === enabledCallsBefore,
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/set-enabled').map((entry) => entry.body)))
+
+section = render(sectionNode)
+const restoreToggle = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')[1]
+check('the switch reads as off once the host confirmed', restoreToggle?.props?.['aria-checked'] === false,
+  JSON.stringify(restoreToggle?.props?.['aria-checked']))
+console.log('DEBUG before restore', JSON.stringify({
+  disabled: restoreToggle?.props?.disabled,
+  on: restoreToggle?.props?.['aria-checked'],
+  disposed: conversationTab?.disposed,
+  calls: requests.filter((e) => e.url.startsWith('/chat-git/set')).map((e) => [e.url, e.body]),
+}))
+restoreToggle.props.onClick()
+await tick()
+await tick()
+console.log('DEBUG after restore', JSON.stringify({
+  disposed: conversationTab?.disposed,
+  calls: requests.filter((e) => e.url.startsWith('/chat-git/set')).map((e) => [e.url, e.body]),
+}))
+check('turning the tab back on restores the seat', conversationTab?.disposed === false,
+  String(conversationTab?.disposed))
+check('the restored seat keeps its id and label',
+  conversationTab?.options?.id === 'chat-git-history' && conversationTab?.options?.label === '历史',
+  JSON.stringify(conversationTab?.options))
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

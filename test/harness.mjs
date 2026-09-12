@@ -476,6 +476,8 @@ try {
     JSON.stringify(settingsState.value?.commits))
   check('the global read carries no workspace root', settingsState.value?.cwd === '',
     JSON.stringify(settingsState.value?.cwd))
+  check('the global read reports the History-tab preference',
+    settingsState.value?.history === true, JSON.stringify(settingsState.value?.history))
   const settingsNoBody = await call(base, '/chat-git/state', {})
   check('an omitted sessionId behaves like an empty one', settingsNoBody.ok === true, JSON.stringify(settingsNoBody))
 
@@ -496,6 +498,28 @@ try {
     git(workspace, ['status', '--porcelain']).out)
   const on = await call(base, '/chat-git/set-enabled', { enabled: true })
   check('re-enabling succeeds while git exists', on.ok === true && on.value.enabled === true, JSON.stringify(on))
+
+  console.log('\n== the History tab can be withdrawn and restored ==')
+  // Presentation only: no git probe guards this, so it must work even on a
+  // machine with no git and must never disturb the checkpoint preference.
+  const tabOff = await call(base, '/chat-git/set-history', { history: false })
+  check('withdrawing the tab succeeds', tabOff.ok === true && tabOff.value.history === false,
+    JSON.stringify(tabOff))
+  const tabOffState = (await call(base, '/chat-git/state', { sessionId: '' })).value
+  check('the settings page reads the withdrawn preference', tabOffState.history === false,
+    JSON.stringify(tabOffState.history))
+  check('withdrawing the tab leaves checkpointing on', tabOffState.enabled === true,
+    JSON.stringify(tabOffState.enabled))
+  // The field name is the whole point: a route that read `enabled` instead
+  // answered ok and coerced every `{ history: true }` to false, leaving the tab
+  // withdrawn forever with no way back.
+  const tabOn = await call(base, '/chat-git/set-history', { history: true })
+  check('restoring the tab succeeds', tabOn.ok === true && tabOn.value.history === true,
+    JSON.stringify(tabOn))
+  const tabMissing = await call(base, '/chat-git/set-history', {})
+  check('a request with no history field turns the tab off rather than erroring',
+    tabMissing.ok === true && tabMissing.value.history === false, JSON.stringify(tabMissing))
+  await call(base, '/chat-git/set-history', { history: true })
 
   console.log('\n== the preference survives a reload ==')
   const reloaded = createContext()

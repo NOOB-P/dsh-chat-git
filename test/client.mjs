@@ -221,6 +221,39 @@ let timelineTurns = [
 /** Sessions the fake workspace service archived. */
 const archived = []
 
+/**
+ * The repository the fake host reports for the workspace pane.
+ *
+ * Deliberately its own data, not derived from `timelineTurns`: the two panes
+ * read two routes, and a stub that fed the commit list from the turn list would
+ * hide exactly the coupling this split removes.
+ */
+const repoCommits = [
+  {
+    sha: 'aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111',
+    short: 'aaaa111',
+    subject: 'Ai-coding：实现登录接口',
+    date: '2026-09-12T10:00:00+08:00',
+  },
+  {
+    sha: 'bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222',
+    short: 'bbbb222',
+    subject: 'Ai-coding：把登录返回值改成 ok',
+    date: '2026-09-12T10:30:00+08:00',
+  },
+]
+
+/** The workspace state the fake `/chat-git/repo` route answers with. */
+let repoState = {
+  cwd: 'C:/ws',
+  root: 'C:/ws',
+  git: { available: true, version: 'git version 2.54.0.windows.1', error: '' },
+  branch: 'main',
+  head: repoCommits[1].sha,
+  dirty: false,
+  commits: repoCommits,
+}
+
 /** Host answers for the routes the client half needs. */
 globalThis.fetch = async (url, init) => {
   const body = init === undefined ? {} : JSON.parse(init.body)
@@ -254,6 +287,14 @@ globalThis.fetch = async (url, init) => {
     }
   } else if (url === '/chat-git/timeline') {
     payload = { ok: true, value: { cwd: 'C:/ws', turns: timelineTurns } }
+  } else if (url === '/chat-git/repo') {
+    // Mirrors the host: an empty sessionId is refused, because the workspace
+    // pane always knows which conversation it is looking at.
+    payload = body.sessionId === ''
+      ? { ok: false, error: { code: 'bad-request', message: 'sessionId is required' } }
+      : { ok: true, value: { ...repoState } }
+  } else if (url === '/chat-git/restore') {
+    payload = { ok: true, value: { restored: body.sha, removed: ['extra.txt'] } }
   } else if (url === '/chat-git/models') {
     payload = {
       ok: true,
@@ -752,11 +793,30 @@ check('a card names its turn', panelText.includes('第 1 轮'), JSON.stringify(p
 check('the cards keep the conversation order',
   panelText.indexOf('实现登录接口') < panelText.indexOf('把登录返回值改成 ok'),
   JSON.stringify(panelText.slice(0, 300)))
-check('a card shows the checkpoint it produced', panelText.includes('aaaa111'),
-  JSON.stringify(panelText.slice(0, 300)))
-check('a turn with no checkpoint says so', panelText.includes('没有产生提交'),
-  JSON.stringify(panelText.slice(0, 400)))
 check('the panel counts the turns', panelText.includes('3 轮'), JSON.stringify(panelText.slice(0, 120)))
+// The turn list must no longer echo the checkpoint: showing the same commit in
+// both columns was what made the two halves read as one coupled thing.
+check('a conversation card carries no commit line',
+  !textOf(cards[0]).includes('aaaa111'), JSON.stringify(textOf(cards[0])))
+
+console.log('\n== the workspace pane reads git on its own ==')
+// The two panes are independent reads: the left one never asks for a commit and
+// the right one never asks for a turn, which is what lets either half fail on
+// its own without taking the other down.
+const commitsOf = (tree) => findAll(tree, 'div')
+  .filter((node) => String(node.props?.className ?? '').includes('dsh-chat-git-commit'))
+check('the workspace pane read the repository on its own route',
+  requests.some((entry) => entry.url === '/chat-git/repo' && entry.body.sessionId === 'session-live-1'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/repo').map((entry) => entry.body)))
+const repoRows = commitsOf(panel)
+check('the workspace pane lists the repository commits', repoRows.length === 2, String(repoRows.length))
+check('a commit row names its sha and its subject',
+  textOf(repoRows[1]).includes('bbbb222') && textOf(repoRows[1]).includes('把登录返回值改成 ok'),
+  JSON.stringify(textOf(repoRows[1])))
+check('the workspace pane reports the branch and the repository root',
+  panelText.includes('main') && panelText.includes('C:/ws'), JSON.stringify(panelText.slice(-320)))
+check('the workspace pane reports a clean worktree', panelText.includes('工作区干净'),
+  JSON.stringify(panelText.slice(-320)))
 
 console.log('\n== each card offers both branch actions ==')
 check('every card carries exactly the two buttons',
@@ -771,7 +831,7 @@ check('a turn with no closing sequence cannot branch',
 check('the panel explains why that turn cannot branch',
   panelText.includes('没有结束序列'), JSON.stringify(panelText.slice(-200)))
 
-console.log('\n== the dialog asks what to do with the code ==')
+console.log('\n== the dialog asks only about the conversation ==')
 // The dialog is a child of the panel, so its buttons have to be read out of the
 // dialog node itself: collecting every button in the panel would also pick up
 // the card buttons, whose wording ("从这里 fork" / "回退到这里") legitimately
@@ -781,31 +841,41 @@ const dialogOf = (tree) => findAll(tree, 'div')
 findAll(cards[1], 'button')[0].props.onClick()
 panel = render(panelNode)
 const dialogLabels = findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))
-check('the dialog offers both scopes',
-  dialogLabels.includes('仅 fork 对话') && dialogLabels.includes('fork 并还原代码'),
-  JSON.stringify(dialogLabels))
+check('the fork dialog confirms the fork and nothing else',
+  dialogLabels.join('|') === '确认 fork 对话|取消', JSON.stringify(dialogLabels))
 // A fork dialog that also says 回退 makes the user re-read the card button they
 // just pressed to work out which of the two they are in.
 check('a fork dialog never says 回退',
   !dialogLabels.some((label) => label.includes('回退')), JSON.stringify(dialogLabels))
-check('the dialog names the turn', textOf(panel).includes('第 2 轮'), JSON.stringify(textOf(panel).slice(-320)))
+// The code scope is gone: there is no longer a choice to make here, because the
+// repository belongs to the other pane.
+check('the dialog no longer offers a code scope',
+  !dialogLabels.some((label) => label.includes('代码')), JSON.stringify(dialogLabels))
+const dialogText = textOf(dialogOf(panel))
+check('the dialog names the turn', dialogText.includes('第 2 轮'), JSON.stringify(dialogText.slice(-320)))
 check('a fork promises the original survives',
-  textOf(panel).includes('当前会话保持原样'), JSON.stringify(textOf(panel).slice(-320)))
-check('the dialog names the checkpoint the code would return to',
-  textOf(panel).includes('bbbb222'), JSON.stringify(textOf(panel).slice(-320)))
+  dialogText.includes('当前会话保持原样'), JSON.stringify(dialogText.slice(-320)))
+check('the dialog states that the code is not touched',
+  dialogText.includes('工作区的代码不会被改动'), JSON.stringify(dialogText.slice(-320)))
+check('the dialog no longer names a checkpoint',
+  !dialogText.includes('bbbb222'), JSON.stringify(dialogText.slice(-320)))
 
-console.log('\n== a conversation-only fork leaves the repository alone ==')
+console.log('\n== a conversation fork never touches the repository ==')
 forkedSessions.length = 0
 archived.length = 0
 const beforeFork = requests.filter((entry) => entry.url === '/chat-git/revert').length
+const beforeRestores = requests.filter((entry) => entry.url === '/chat-git/restore').length
 const beforeTimelineReads = requests.filter((entry) => entry.url === '/chat-git/timeline').length
-findAll(panel, 'button').find((btn) => textOf(btn) === '仅 fork 对话').props.onClick()
+findAll(panel, 'button').find((btn) => textOf(btn) === '确认 fork 对话').props.onClick()
 await tick()
 await tick()
 await tick()
-check('no repository revert was requested',
-  requests.filter((entry) => entry.url === '/chat-git/revert').length === beforeFork,
-  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/revert').map((entry) => entry.body)))
+// Both write routes are checked, not just the old one: the point of the split is
+// that a conversation action has no git side effect at all.
+check('no repository write was requested',
+  requests.filter((entry) => entry.url === '/chat-git/revert').length === beforeFork
+  && requests.filter((entry) => entry.url === '/chat-git/restore').length === beforeRestores,
+  JSON.stringify(requests.filter((entry) => entry.url.startsWith('/chat-git/')).map((entry) => entry.url)))
 check('the fork happens at that turn closing sequence',
   forkedSessions.length === 1 && forkedSessions[0].atSeq === 20, JSON.stringify(forkedSessions))
 check('the fork inherits the surviving checkpoints',
@@ -826,28 +896,74 @@ panel = render(panelNode)
 const rewindCard = cardsOf(panel)[0]
 findAll(rewindCard, 'button')[1].props.onClick()
 panel = render(panelNode)
+const rewindDialogText = textOf(dialogOf(panel))
 check('the rewind dialog says the original will be archived',
-  textOf(panel).includes('归档'), JSON.stringify(textOf(panel).slice(-320)))
+  rewindDialogText.includes('归档'), JSON.stringify(rewindDialogText.slice(-320)))
 const rewindLabels = findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))
 check('a rewind dialog names only 回退, never fork',
-  rewindLabels.includes('仅回退对话') && rewindLabels.includes('回退并还原代码')
-  && !rewindLabels.some((label) => label.includes('fork')),
-  JSON.stringify(rewindLabels))
+  rewindLabels.join('|') === '确认回退对话|取消', JSON.stringify(rewindLabels))
 
 forkedSessions.length = 0
 archived.length = 0
 const beforeRewind = requests.filter((entry) => entry.url === '/chat-git/revert').length
-findAll(panel, 'button').find((btn) => textOf(btn) === '回退并还原代码').props.onClick()
+const beforeRewindRestores = requests.filter((entry) => entry.url === '/chat-git/restore').length
+findAll(panel, 'button').find((btn) => textOf(btn) === '确认回退对话').props.onClick()
 await tick()
 await tick()
 await tick()
-const revertCalls = requests.filter((entry) => entry.url === '/chat-git/revert')
-check('the code scope reverts the repository first',
-  revertCalls.length === beforeRewind + 1 && revertCalls.at(-1)?.body?.sha === 'aaaa1111',
-  JSON.stringify(revertCalls.at(-1)?.body))
+check('the rewind never writes to the repository',
+  requests.filter((entry) => entry.url === '/chat-git/revert').length === beforeRewind
+  && requests.filter((entry) => entry.url === '/chat-git/restore').length === beforeRewindRestores,
+  JSON.stringify(requests.filter((entry) => entry.url.startsWith('/chat-git/')).map((entry) => entry.url)))
 check('the fork still happens at that turn', forkedSessions[0]?.atSeq === 10, JSON.stringify(forkedSessions))
 check('rewinding archives the original conversation',
   archived.length === 1 && archived[0] === 'session-live-1', JSON.stringify(archived))
+
+// ---------------------------------------------------------------------------
+// The workspace pane restores code on its own
+// ---------------------------------------------------------------------------
+
+console.log('\n== the workspace pane restores code without the conversation ==')
+panel = render(panelNode)
+// The rewind above bumped the revision, which re-runs the repository read. Until
+// that settles the pane is genuinely busy, so the reads are awaited before the
+// rows are captured — otherwise the clicks below land on a disabled row's
+// closure and silently do nothing.
+await tick()
+await tick()
+panel = render(panelNode)
+const beforeRestoreForks = forkedSessions.length
+const beforeRestoreArchived = archived.length
+const restoreRows = commitsOf(panel)
+check('every commit row offers exactly one action',
+  restoreRows.every((row) => findAll(row, 'button').length === 1),
+  JSON.stringify(restoreRows.map((row) => findAll(row, 'button').length)))
+check('the restore button is labelled as such',
+  textOf(findAll(restoreRows[1], 'button')[0]) === '还原到这里',
+  JSON.stringify(textOf(findAll(restoreRows[1], 'button')[0])))
+// Two steps, exactly like the per-turn icon button: the first click only arms.
+findAll(restoreRows[1], 'button')[0].props.onClick()
+panel = render(panelNode)
+const armedRow = commitsOf(panel)[1]
+check('the first click arms instead of restoring',
+  !requests.some((entry) => entry.url === '/chat-git/restore'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/restore').map((entry) => entry.body)))
+check('the armed row asks for confirmation',
+  textOf(findAll(armedRow, 'button')[0]) === '再点一次确认还原',
+  JSON.stringify(textOf(findAll(armedRow, 'button')[0])))
+check('the armed row offers a way back', textOf(armedRow).includes('取消'), JSON.stringify(textOf(armedRow)))
+findAll(armedRow, 'button')[0].props.onClick()
+await tick()
+await tick()
+await tick()
+const restoreCalls = requests.filter((entry) => entry.url === '/chat-git/restore')
+check('the second click restores that commit',
+  restoreCalls.length === 1 && restoreCalls[0].body.sha === repoCommits[1].sha,
+  JSON.stringify(restoreCalls.map((entry) => entry.body)))
+check('restoring code forks no conversation', forkedSessions.length === beforeRestoreForks,
+  JSON.stringify(forkedSessions))
+check('restoring code archives no conversation', archived.length === beforeRestoreArchived,
+  JSON.stringify(archived))
 
 // ---------------------------------------------------------------------------
 // Withdrawing the History tab

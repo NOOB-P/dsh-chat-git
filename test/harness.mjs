@@ -811,6 +811,84 @@ try {
   check('the timeline needs a sessionId',
     noTimelineId.ok === false && noTimelineId.error.code === 'bad-request', JSON.stringify(noTimelineId))
 
+  console.log('\n== the workspace pane reads the repository on its own route ==')
+  // The whole point of the split: this answer never mentions a turn, and the
+  // timeline answer above never mentions a repository. Reading git directly is
+  // what lets the pane show commits this plugin did not create.
+  const repoRead = (await call(aiServer.base, '/chat-git/repo', { sessionId: 'session-timeline' })).value
+  // git echoes the root with forward slashes even on Windows, so the comparison
+  // normalizes both sides rather than assuming the separator `join` produced.
+  const samePath = (left, right) => String(left).replace(/\\/g, '/').toLowerCase()
+    === String(right).replace(/\\/g, '/').toLowerCase()
+  check('the repo route reports the repository root', samePath(repoRead?.root, timelineWorkspace),
+    String(repoRead?.root))
+  check('the repo route names the current branch', repoRead?.branch !== '', JSON.stringify(repoRead?.branch))
+  check('the repo route reports a clean worktree', repoRead?.dirty === false, JSON.stringify(repoRead?.dirty))
+  check('the repo route reports HEAD', typeof repoRead?.head === 'string' && repoRead.head.length === 40,
+    JSON.stringify(repoRead?.head))
+  check('the repo route lists the history', repoRead?.commits?.length === 1,
+    JSON.stringify(repoRead?.commits?.length))
+  check('a commit row carries the four fields the pane renders',
+    typeof repoRead?.commits?.[0]?.sha === 'string' && typeof repoRead?.commits?.[0]?.short === 'string'
+    && typeof repoRead?.commits?.[0]?.subject === 'string' && typeof repoRead?.commits?.[0]?.date === 'string',
+    JSON.stringify(repoRead?.commits?.[0]))
+  const noRepoId = await call(aiServer.base, '/chat-git/repo', {})
+  check('the repo route needs a sessionId',
+    noRepoId.ok === false && noRepoId.error.code === 'bad-request', JSON.stringify(noRepoId))
+  const unknownRepo = await call(aiServer.base, '/chat-git/repo', { sessionId: 'session-never-opened' })
+  check('the repo route refuses a session with no recorded workspace',
+    unknownRepo.ok === false && unknownRepo.error.code === 'session-unknown', JSON.stringify(unknownRepo))
+
+  console.log('\n== the workspace restore moves code and nothing else ==')
+  writeFileSync(join(timelineWorkspace, 'second.js'), 'export const second = 2\n', 'utf8')
+  await aiCtx.emit('agent/turn-stopping', stop('session-timeline', timelineWorkspace, 2))
+  const twoCommits = (await call(aiServer.base, '/chat-git/repo', { sessionId: 'session-timeline' })).value
+  check('the second turn produced a second commit', twoCommits?.commits?.length === 2,
+    JSON.stringify(twoCommits?.commits?.length))
+  const firstSha = twoCommits.commits[1].sha
+  const checkpointsBefore = (await call(aiServer.base,
+    '/chat-git/state', { sessionId: 'session-timeline' })).value.commits.length
+  const restoredWorkspace = await call(aiServer.base,
+    '/chat-git/restore', { sessionId: 'session-timeline', sha: firstSha })
+  check('a workspace restore succeeds', restoredWorkspace.ok === true, JSON.stringify(restoredWorkspace))
+  check('it prunes the path that checkpoint never contained',
+    (restoredWorkspace.value?.removed ?? []).includes('second.js'),
+    JSON.stringify(restoredWorkspace.value?.removed))
+  check('the pruned file is gone from the worktree',
+    git(timelineWorkspace, ['ls-files', 'second.js']).out === '',
+    JSON.stringify(git(timelineWorkspace, ['ls-files', 'second.js']).out))
+  check('HEAD is left where it was',
+    git(timelineWorkspace, ['rev-list', '--count', 'HEAD']).out === '2',
+    git(timelineWorkspace, ['rev-list', '--count', 'HEAD']).out)
+  // The decoupling, asserted directly: `/chat-git/revert` drops the later
+  // checkpoints, and this route deliberately must not, because the conversation
+  // is not being rewound.
+  const checkpointsAfter = (await call(aiServer.base,
+    '/chat-git/state', { sessionId: 'session-timeline' })).value.commits.length
+  check('restoring code leaves the conversation checkpoints intact',
+    checkpointsAfter === checkpointsBefore, `${String(checkpointsBefore)} -> ${String(checkpointsAfter)}`)
+  // Resolution happens before argv, so a revision that would read as a git
+  // option can never become one.
+  const revision = await call(aiServer.base,
+    '/chat-git/restore', { sessionId: 'session-timeline', sha: 'HEAD~1' })
+  check('a revision that is not an object name is refused',
+    revision.ok === false && revision.error.code === 'unknown-commit', JSON.stringify(revision))
+  const injected = await call(aiServer.base,
+    '/chat-git/restore', { sessionId: 'session-timeline', sha: '--upload-pack=touch pwned' })
+  check('a sha that looks like an option is refused',
+    injected.ok === false && injected.error.code === 'unknown-commit', JSON.stringify(injected))
+  const unknownCommit = await call(aiServer.base,
+    '/chat-git/restore', { sessionId: 'session-timeline', sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' })
+  check('a commit that is not in this repository is refused',
+    unknownCommit.ok === false && unknownCommit.error.code === 'unknown-commit', JSON.stringify(unknownCommit))
+  const noRestoreSha = await call(aiServer.base, '/chat-git/restore', { sessionId: 'session-timeline' })
+  check('a restore without a sha is refused',
+    noRestoreSha.ok === false && noRestoreSha.error.code === 'unknown-commit', JSON.stringify(noRestoreSha))
+  const noRestoreSession = await call(aiServer.base, '/chat-git/restore', { sha: firstSha })
+  check('a restore without a session is refused',
+    noRestoreSession.ok === false && noRestoreSession.error.code === 'bad-request',
+    JSON.stringify(noRestoreSession))
+
   console.log('\n== an absent model layer never costs a checkpoint ==')
   // No `llm` and no model route: the whole AI path must be skipped, not fatal.
   const bare = createContext()

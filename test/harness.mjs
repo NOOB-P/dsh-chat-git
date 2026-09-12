@@ -242,10 +242,25 @@ const modelRouteStub = {
 /** Session logs the fake `sessions` service serves, keyed by session id. */
 const sessionLogs = new Map()
 
+/**
+ * Live session headers, keyed by session id.
+ *
+ * Kept separate from {@link sessionLogs} because the two answer different
+ * questions: a log is what the timeline folds into turns, while a header is what
+ * the workspace pane needs to find a repository for a conversation this plugin
+ * has never checkpointed. A session can legitimately have either one alone.
+ */
+const sessionHeaders = new Map()
+
 const sessionsStub = {
   get(id) {
     const events = sessionLogs.get(id)
-    return events === undefined ? undefined : { snapshotEvents: () => events }
+    const header = sessionHeaders.get(id)
+    if (events === undefined && header === undefined) return undefined
+    return {
+      header,
+      ...(events === undefined ? {} : { snapshotEvents: () => events }),
+    }
   },
 }
 
@@ -520,6 +535,70 @@ try {
   check('a request with no history field turns the tab off rather than erroring',
     tabMissing.ok === true && tabMissing.value.history === false, JSON.stringify(tabMissing))
   await call(base, '/chat-git/set-history', { history: true })
+
+  console.log('\n== the automatic save interval ==')
+  // The interval throttles the git side only. The conversation keeps being
+  // recorded every turn by the harness's own session log, so this setting can
+  // never make the conversation history sparser — it trades checkpoint
+  // granularity for fewer commits, and the changes wait in the worktree.
+  const intervalDefault = (await call(base, '/chat-git/state', { sessionId: '' })).value
+  check('the interval defaults to every turn', intervalDefault.interval === 1,
+    JSON.stringify(intervalDefault.interval))
+  // 0 would mean "never commit" while the switch still reads as on, so it is
+  // refused rather than stored.
+  const badZero = await call(base, '/chat-git/set-interval', { interval: 0 })
+  check('an interval of 0 is refused', badZero.ok === false && badZero.error.code === 'bad-preference',
+    JSON.stringify(badZero))
+  const badHigh = await call(base, '/chat-git/set-interval', { interval: 11 })
+  check('an interval above the cap is refused',
+    badHigh.ok === false && badHigh.error.code === 'bad-preference', JSON.stringify(badHigh))
+  const badType = await call(base, '/chat-git/set-interval', { interval: '2' })
+  check('a non-integer interval is refused',
+    badType.ok === false && badType.error.code === 'bad-preference', JSON.stringify(badType))
+  check('a refused interval leaves the stored preference untouched',
+    (await call(base, '/chat-git/state', { sessionId: '' })).value.interval === 1)
+  const everyThree = await call(base, '/chat-git/set-interval', { interval: 3 })
+  check('an interval of three is accepted', everyThree.ok === true && everyThree.value.interval === 3,
+    JSON.stringify(everyThree))
+
+  const intervalWs = join(sandbox, 'interval')
+  mkdirSync(intervalWs, { recursive: true })
+  await ctx.emit('agent/session-start', start('session-interval', intervalWs))
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+  /** Commit count, where an unborn HEAD reads as zero rather than as an error. */
+  const commitsIn = (cwd) => git(cwd, ['rev-list', '--count', 'HEAD']).out || '0'
+
+  writeFileSync(join(intervalWs, 'one.txt'), 'one\n', 'utf8')
+  await ctx.emit('agent/inbox/claimed', claim('session-interval', intervalWs, 1, '第一轮'))
+  await ctx.emit('agent/turn-stopping', stop('session-interval', intervalWs, 1))
+  check('a turn before the interval is not committed', commitsIn(intervalWs) === '0', commitsIn(intervalWs))
+  check('the uncommitted change waits in the worktree',
+    git(intervalWs, ['status', '--porcelain']).out.includes('one.txt'),
+    git(intervalWs, ['status', '--porcelain']).out)
+
+  writeFileSync(join(intervalWs, 'two.txt'), 'two\n', 'utf8')
+  await ctx.emit('agent/inbox/claimed', claim('session-interval', intervalWs, 2, '第二轮'))
+  await ctx.emit('agent/turn-stopping', stop('session-interval', intervalWs, 2))
+  check('the second turn is still not committed', commitsIn(intervalWs) === '0', commitsIn(intervalWs))
+
+  writeFileSync(join(intervalWs, 'three.txt'), 'three\n', 'utf8')
+  await ctx.emit('agent/inbox/claimed', claim('session-interval', intervalWs, 3, '第三轮'))
+  await ctx.emit('agent/turn-stopping', stop('session-interval', intervalWs, 3))
+  check('the eligible turn commits', commitsIn(intervalWs) === '1', commitsIn(intervalWs))
+  // The whole point of accumulating: everything written across the interval
+  // lands in the one commit, not just the last turn's file.
+  const intervalShow = git(intervalWs, ['show', '--name-only', '--format=%s', 'HEAD']).out
+  check('the commit carries every file written since the last checkpoint',
+    intervalShow.includes('one.txt') && intervalShow.includes('two.txt') && intervalShow.includes('three.txt'),
+    JSON.stringify(intervalShow))
+  check('the commit is titled for the turn that produced it',
+    intervalShow.startsWith('Ai-coding：第三轮'), JSON.stringify(intervalShow))
+  check('the worktree is clean once the interval commits',
+    git(intervalWs, ['status', '--porcelain']).out === '', git(intervalWs, ['status', '--porcelain']).out)
+
+  const backToOne = await call(base, '/chat-git/set-interval', { interval: 1 })
+  check('the interval can be returned to every turn',
+    backToOne.ok === true && backToOne.value.interval === 1, JSON.stringify(backToOne))
 
   console.log('\n== the preference survives a reload ==')
   const reloaded = createContext()
@@ -828,16 +907,47 @@ try {
     JSON.stringify(repoRead?.head))
   check('the repo route lists the history', repoRead?.commits?.length === 1,
     JSON.stringify(repoRead?.commits?.length))
-  check('a commit row carries the four fields the pane renders',
+  // Author included: the pane shows the repository's real history, so a commit
+  // this plugin did not write still has to be attributable.
+  check('a commit row carries every field the pane renders',
     typeof repoRead?.commits?.[0]?.sha === 'string' && typeof repoRead?.commits?.[0]?.short === 'string'
-    && typeof repoRead?.commits?.[0]?.subject === 'string' && typeof repoRead?.commits?.[0]?.date === 'string',
+    && typeof repoRead?.commits?.[0]?.subject === 'string' && typeof repoRead?.commits?.[0]?.date === 'string'
+    && typeof repoRead?.commits?.[0]?.author === 'string' && repoRead.commits[0].author !== '',
     JSON.stringify(repoRead?.commits?.[0]))
+  check('the short id is an abbreviation of the full one',
+    repoRead.commits[0].sha.startsWith(repoRead.commits[0].short),
+    JSON.stringify({ sha: repoRead.commits[0].sha, short: repoRead.commits[0].short }))
+  check('the date is an ISO timestamp the client can parse',
+    !Number.isNaN(Date.parse(repoRead.commits[0].date)), JSON.stringify(repoRead.commits[0].date))
   const noRepoId = await call(aiServer.base, '/chat-git/repo', {})
   check('the repo route needs a sessionId',
     noRepoId.ok === false && noRepoId.error.code === 'bad-request', JSON.stringify(noRepoId))
   const unknownRepo = await call(aiServer.base, '/chat-git/repo', { sessionId: 'session-never-opened' })
   check('the repo route refuses a session with no recorded workspace',
     unknownRepo.ok === false && unknownRepo.error.code === 'session-unknown', JSON.stringify(unknownRepo))
+
+  // The exact failure the pane used to show: a conversation that was already
+  // open when this plugin loaded has no `cwd` in the store, so the store alone
+  // answered "no workspace is recorded" for a repository sitting right there.
+  // The live session header is authoritative, and the route must consult it.
+  const headerWorkspace = join(sandbox, 'header-only')
+  mkdirSync(headerWorkspace, { recursive: true })
+  git(headerWorkspace, ['init'])
+  sessionHeaders.set('session-header-only', { id: 'session-header-only', cwd: headerWorkspace })
+  const headerRead = await call(aiServer.base, '/chat-git/repo', { sessionId: 'session-header-only' })
+  check('a session the store never checkpointed still resolves its workspace from its live header',
+    headerRead.ok === true, JSON.stringify(headerRead))
+  check('the resolved root is that header cwd',
+    samePath(headerRead.value?.root, headerWorkspace), String(headerRead.value?.root))
+  // Remembering it is what makes the follow-up reads cheap and consistent.
+  const headerState = (await call(aiServer.base, '/chat-git/state', { sessionId: 'session-header-only' })).value
+  check('the header-resolved workspace is remembered for the next read',
+    samePath(headerState?.cwd, headerWorkspace), String(headerState?.cwd))
+  // A cwd still never comes from the request: the same call naming a headerless
+  // session is refused, which is what keeps the route off arbitrary directories.
+  const noHeader = await call(aiServer.base, '/chat-git/repo', { sessionId: 'session-no-header' })
+  check('a session with neither a record nor a header is still refused',
+    noHeader.ok === false && noHeader.error.code === 'session-unknown', JSON.stringify(noHeader))
 
   console.log('\n== the workspace restore moves code and nothing else ==')
   writeFileSync(join(timelineWorkspace, 'second.js'), 'export const second = 2\n', 'utf8')

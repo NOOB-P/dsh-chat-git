@@ -190,9 +190,10 @@ const requests = []
  */
 let storedSummary = { mode: 'current', provider: '', model: '' }
 
-/** The checkpoint master switch and the History-tab preference. */
+/** The checkpoint master switch, the History-tab preference, and the interval. */
 let storedEnabled = true
 let storedHistory = true
+let storedInterval = 1
 
 /** The timeline the fake host serves, including one turn that never closed. */
 let timelineTurns = [
@@ -234,12 +235,14 @@ const repoCommits = [
     short: 'aaaa111',
     subject: 'Ai-coding：实现登录接口',
     date: '2026-09-12T10:00:00+08:00',
+    author: 'ClownLMe',
   },
   {
     sha: 'bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222',
     short: 'bbbb222',
     subject: 'Ai-coding：把登录返回值改成 ok',
     date: '2026-09-12T10:30:00+08:00',
+    author: 'ClownLMe',
   },
 ]
 
@@ -253,6 +256,19 @@ let repoState = {
   dirty: false,
   commits: repoCommits,
 }
+
+/**
+ * How the fake `/chat-git/repo` route fails, when it should.
+ *
+ * `repoFailure` is a **bare string**, mirroring the web server's own 404 body
+ * (`{ error: 'not found' }`) — the shape that used to be read as
+ * `error.message` and came back `undefined`, so the pane showed a generic
+ * failure naming the repository when the route was what was missing.
+ * `repoUnreachable` rejects the fetch instead, which is what a host process
+ * that does not serve the route at all looks like from the browser.
+ */
+let repoFailure = ''
+let repoUnreachable = false
 
 /** Host answers for the routes the client half needs. */
 globalThis.fetch = async (url, init) => {
@@ -272,6 +288,7 @@ globalThis.fetch = async (url, init) => {
         // Mirrors the host: the settings page's global read also carries the
         // History-tab preference, which is what the tab's registration follows.
         history: storedHistory,
+        interval: storedInterval,
         summary: { ...storedSummary },
         committed: true,
         stateFile: 'C:/tmp/chat-git.json',
@@ -288,11 +305,14 @@ globalThis.fetch = async (url, init) => {
   } else if (url === '/chat-git/timeline') {
     payload = { ok: true, value: { cwd: 'C:/ws', turns: timelineTurns } }
   } else if (url === '/chat-git/repo') {
+    if (repoUnreachable) throw new Error('route not mounted')
     // Mirrors the host: an empty sessionId is refused, because the workspace
     // pane always knows which conversation it is looking at.
-    payload = body.sessionId === ''
-      ? { ok: false, error: { code: 'bad-request', message: 'sessionId is required' } }
-      : { ok: true, value: { ...repoState } }
+    payload = repoFailure !== ''
+      ? { ok: false, error: repoFailure }
+      : body.sessionId === ''
+        ? { ok: false, error: { code: 'bad-request', message: 'sessionId is required' } }
+        : { ok: true, value: { ...repoState } }
   } else if (url === '/chat-git/restore') {
     payload = { ok: true, value: { restored: body.sha, removed: ['extra.txt'] } }
   } else if (url === '/chat-git/models') {
@@ -336,6 +356,18 @@ globalThis.fetch = async (url, init) => {
   } else if (url === '/chat-git/set-history') {
     storedHistory = body.history === true
     payload = { ok: true, value: { history: storedHistory } }
+  } else if (url === '/chat-git/set-interval') {
+    // Mirrors the host's own validation: anything outside 1..10 is refused
+    // rather than stored, because 0 would silently stop committing.
+    if (Number.isInteger(body.interval) && body.interval >= 1 && body.interval <= 10) {
+      storedInterval = body.interval
+      payload = { ok: true, value: { interval: storedInterval } }
+    } else {
+      payload = {
+        ok: false,
+        error: { code: 'bad-preference', message: 'interval must be an integer between 1 and 10' },
+      }
+    }
   } else if (url === '/chat-git/revert') {
     payload = { ok: true, value: { restored: body.sha, turn: 1, dropped: 1, removed: ['extra.txt'] } }
   } else if (url === '/chat-git/inherit') {
@@ -486,9 +518,12 @@ console.log('\n== the plugin stylesheet ==')
 check('one stylesheet is installed', styleElements.length === 1, String(styleElements.length))
 check('the stylesheet is namespaced to this plugin', styleElements[0]?.id === 'dsh-chat-git-style',
   String(styleElements[0]?.id))
+// The rule this guards is "no product selector is styled", so it looks for a
+// bare `body` **selector** rather than the substring: a namespaced class like
+// `.dsh-chat-git-commit-body` legitimately contains the word.
 check('the stylesheet styles only this plugin classes',
   String(styleElements[0]?.textContent).includes('.dsh-chat-git-icon')
-  && !String(styleElements[0]?.textContent).includes('body'),
+  && !/(^|[},])\s*(body|html|\*)\s*[{,]/.test(String(styleElements[0]?.textContent)),
   String(styleElements[0]?.textContent).slice(0, 60))
 check('a second apply does not double the stylesheet', (() => {
   const before = styleElements.length
@@ -659,7 +694,16 @@ check('the summary card is titled', coldText.includes('AI 总结提交信息'), 
 check('the summary card promises the fallback',
   coldText.includes('回退为提示词'), JSON.stringify(coldText))
 
-const coldModes = findAll(section, 'button').filter((btn) => btn.props?.role === 'radio')
+// The page now carries two radiogroups (the checkpoint interval and the summary
+// mode), so a group is read out of its own node rather than by collecting every
+// radio on the page — the earlier page-wide collection silently re-labelled the
+// interval buttons as summary modes.
+const radioGroupOf = (tree, label) => findAll(tree, 'div')
+  .find((node) => node.props?.role === 'radiogroup' && node.props?.['aria-label'] === label)
+const radiosIn = (tree, label) => findAll(radioGroupOf(tree, label), 'button')
+  .filter((btn) => btn.props?.role === 'radio')
+
+const coldModes = radiosIn(section, '总结模型')
 check('the summary model offers three modes', coldModes.length === 3, String(coldModes.length))
 check('the three modes are the expected ones',
   coldModes.map((btn) => textOf(btn)).join('|') === '关闭|使用当前模型|指定模型',
@@ -670,6 +714,21 @@ check('the default mode shows as selected before the host is read',
 check('the modes cannot be clicked before the host has been read',
   coldModes.every((btn) => btn.props?.disabled === true),
   JSON.stringify(coldModes.map((btn) => btn.props?.disabled)))
+
+console.log('\n== the automatic save interval ==')
+const coldInterval = radiosIn(section, '自动保存间隔')
+check('the interval offers the three choices', coldInterval.length === 3, String(coldInterval.length))
+check('the choices are every turn, every 2, every 3',
+  coldInterval.map((btn) => textOf(btn)).join('|') === '每轮|每 2 轮|每 3 轮',
+  coldInterval.map((btn) => textOf(btn)).join('|'))
+check('the default is every turn before the host is read',
+  JSON.stringify(coldInterval.map((btn) => btn.props?.['aria-checked'])) === '[true,false,false]',
+  JSON.stringify(coldInterval.map((btn) => btn.props?.['aria-checked'])))
+check('the interval cannot be changed before the host has been read',
+  coldInterval.every((btn) => btn.props?.disabled === true),
+  JSON.stringify(coldInterval.map((btn) => btn.props?.disabled)))
+check('the interval hint says the conversation is unaffected',
+  coldText.includes('对话本身每一轮都会被记录'), JSON.stringify(coldText))
 check('the pickers are hidden while the mode is not custom',
   findAll(section, 'select').length === 0, String(findAll(section, 'select').length))
 
@@ -690,12 +749,43 @@ check('the switch renders as on once the host reported the preference on',
 check('the switch is enabled once the host has been read', warmSwitch?.props?.disabled === false,
   String(warmSwitch?.props?.disabled))
 
-const warmModes = findAll(section, 'button').filter((btn) => btn.props?.role === 'radio')
+const warmModes = radiosIn(section, '总结模型')
 check('the stored mode is the selected one', warmModes[1]?.props?.['aria-checked'] === true,
   JSON.stringify(warmModes.map((btn) => btn.props?.['aria-checked'])))
 check('the modes are enabled once the host has been read',
   warmModes.every((btn) => btn.props?.disabled === false),
   JSON.stringify(warmModes.map((btn) => btn.props?.disabled)))
+
+const warmInterval = radiosIn(section, '自动保存间隔')
+check('the interval is enabled once the host has been read',
+  warmInterval.every((btn) => btn.props?.disabled === false),
+  JSON.stringify(warmInterval.map((btn) => btn.props?.disabled)))
+check('the interval reflects the stored preference',
+  JSON.stringify(warmInterval.map((btn) => btn.props?.['aria-checked'])) === '[true,false,false]',
+  JSON.stringify(warmInterval.map((btn) => btn.props?.['aria-checked'])))
+// Choosing an interval is its own route: it must not be mistaken for the
+// checkpoint switch, which would silently disable checkpointing instead.
+warmInterval[2].props.onClick()
+await tick()
+const intervalCall = requests.find((entry) => entry.url === '/chat-git/set-interval')
+check('choosing 3 turns sends the interval on its own route',
+  intervalCall?.body?.interval === 3, JSON.stringify(intervalCall?.body))
+check('choosing an interval never touches the checkpoint switch',
+  !requests.some((entry) => entry.url === '/chat-git/set-enabled'),
+  JSON.stringify(requests.filter((entry) => entry.url.startsWith('/chat-git/set')).map((entry) => entry.url)))
+section = render(sectionNode)
+const afterInterval = radiosIn(section, '自动保存间隔')
+check('the interval control adopts the host answer',
+  JSON.stringify(afterInterval.map((btn) => btn.props?.['aria-checked'])) === '[false,false,true]',
+  JSON.stringify(afterInterval.map((btn) => btn.props?.['aria-checked'])))
+// Back to every turn, so the later checks read the default state.
+radiosIn(section, '自动保存间隔')[0].props.onClick()
+await tick()
+section = render(sectionNode)
+check('the interval can be returned to every turn',
+  intervalCall !== undefined
+  && radiosIn(section, '自动保存间隔')[0]?.props?.['aria-checked'] === true,
+  JSON.stringify(radiosIn(section, '自动保存间隔').map((btn) => btn.props?.['aria-checked'])))
 check('the current mode names the concrete route',
   warmText.includes('deepseek-official / deepseek-v4-flash'), JSON.stringify(warmText))
 check('the model catalogue was read from the host',
@@ -706,7 +796,7 @@ console.log('\n== choosing a summary model ==')
 // Selecting the custom mode must carry a usable route in the same patch: the
 // host refuses a custom mode with no route, so sending the mode alone would
 // answer the click with an error.
-warmModes[2].props.onClick()
+radiosIn(section, '总结模型')[2].props.onClick()
 await tick()
 const customCall = requests.find((entry) => entry.url === '/chat-git/set-summary')
 check('choosing the custom mode sends a complete route',
@@ -803,8 +893,11 @@ console.log('\n== the workspace pane reads git on its own ==')
 // The two panes are independent reads: the left one never asks for a commit and
 // the right one never asks for a turn, which is what lets either half fail on
 // its own without taking the other down.
+// Matched as an exact class token, not a substring: a commit row also carries
+// `dsh-chat-git-commit-body` and `dsh-chat-git-commit-meta`, so a substring test
+// counted three nodes per commit and made row indices meaningless.
 const commitsOf = (tree) => findAll(tree, 'div')
-  .filter((node) => String(node.props?.className ?? '').includes('dsh-chat-git-commit'))
+  .filter((node) => String(node.props?.className ?? '').split(/\s+/).includes('dsh-chat-git-commit'))
 check('the workspace pane read the repository on its own route',
   requests.some((entry) => entry.url === '/chat-git/repo' && entry.body.sessionId === 'session-live-1'),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/repo').map((entry) => entry.body)))
@@ -813,6 +906,22 @@ check('the workspace pane lists the repository commits', repoRows.length === 2, 
 check('a commit row names its sha and its subject',
   textOf(repoRows[1]).includes('bbbb222') && textOf(repoRows[1]).includes('把登录返回值改成 ok'),
   JSON.stringify(textOf(repoRows[1])))
+// The pane lists the repository's real history, not only this plugin's
+// checkpoints, so a commit has to say who wrote it and when.
+check('a commit row carries the author and the time',
+  textOf(repoRows[1]).includes('ClownLMe') && textOf(repoRows[1]).includes('10:30'),
+  JSON.stringify(textOf(repoRows[1])))
+// The gutter is what makes the list read like `git log --graph`; it is drawn by
+// CSS, so the only thing the markup owes the stylesheet is the hook element.
+check('every commit row carries the graph gutter',
+  repoRows.every((row) => findAll(row, 'span')
+    .some((span) => String(span.props?.className ?? '').split(/\s+/).includes('dsh-chat-git-graph'))),
+  JSON.stringify(repoRows.map((row) => findAll(row, 'span').map((span) => span.props?.className))))
+check('the gutter is hidden from assistive tech',
+  findAll(repoRows[0], 'span')
+    .filter((span) => String(span.props?.className ?? '').includes('dsh-chat-git-graph'))
+    .every((span) => span.props?.['aria-hidden'] === 'true'),
+  JSON.stringify(findAll(repoRows[0], 'span').map((span) => span.props?.['aria-hidden'])))
 check('the workspace pane reports the branch and the repository root',
   panelText.includes('main') && panelText.includes('C:/ws'), JSON.stringify(panelText.slice(-320)))
 check('the workspace pane reports a clean worktree', panelText.includes('工作区干净'),
@@ -964,6 +1073,70 @@ check('restoring code forks no conversation', forkedSessions.length === beforeRe
   JSON.stringify(forkedSessions))
 check('restoring code archives no conversation', archived.length === beforeRestoreArchived,
   JSON.stringify(archived))
+
+// ---------------------------------------------------------------------------
+// A failed workspace read
+// ---------------------------------------------------------------------------
+
+console.log('\n== a failed workspace read is named and recoverable ==')
+// The bare-string body is the web server's own 404 shape (`{ error: 'not found' }`),
+// which is exactly what a host process still running the previous build answers
+// for a route it does not serve. Reading `.message` off that string yielded
+// `undefined`, so the pane fell back to a generic failure that named the
+// repository when the route was what was missing — and it stayed stuck until
+// some unrelated action happened to re-read it.
+repoFailure = 'not found'
+/**
+ * Drive one effect-backed re-read to completion.
+ *
+ * The order matters, and getting it wrong is what made an earlier version of
+ * this block pass for the wrong reason: the read lives in an effect, and an
+ * effect only runs on a render. So the render that mounts the effect has to
+ * come *after* the action that bumped the revision, and the ticks that settle
+ * the request have to come between that render and the one that asserts.
+ */
+const settleRead = async () => {
+  await tick()
+  panel = render(panelNode)
+  await tick()
+  panel = render(panelNode)
+}
+// A successful restore bumps the revision, which is what re-runs the read.
+findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
+panel = render(panelNode)
+findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
+await settleRead()
+const failedText = textOf(panel)
+check('the host\'s own words are surfaced instead of a generic failure',
+  failedText.includes('not found'), JSON.stringify(failedText.slice(-300)))
+check('the pane no longer blames the repository for a missing route',
+  !failedText.includes('没有可读取的仓库'), JSON.stringify(failedText.slice(-300)))
+check('the pane offers a retry', findAll(panel, 'button').some((btn) => textOf(btn) === '重试'),
+  JSON.stringify(findAll(panel, 'button').map((btn) => textOf(btn))))
+// Retrying is the whole point of showing the control: the read must actually
+// run again, and a route that is back must repopulate the list.
+repoFailure = ''
+findAll(panel, 'button').find((btn) => textOf(btn) === '重试').props.onClick()
+await settleRead()
+check('retrying re-reads the repository', commitsOf(panel).length === 2,
+  JSON.stringify(commitsOf(panel).length))
+check('the error is cleared once the read succeeds', !textOf(panel).includes('not found'),
+  JSON.stringify(textOf(panel).slice(-200)))
+
+// A host that serves no such route at all looks like a rejected fetch, and the
+// transport message is the honest thing to show for it.
+repoUnreachable = true
+findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
+panel = render(panelNode)
+findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
+await settleRead()
+check('an unreachable route reports the transport, not the repository',
+  textOf(panel).includes('路由不可用'), JSON.stringify(textOf(panel).slice(-300)))
+repoUnreachable = false
+findAll(panel, 'button').find((btn) => textOf(btn) === '重试').props.onClick()
+await settleRead()
+check('the pane recovers once the route answers again', commitsOf(panel).length === 2,
+  JSON.stringify(commitsOf(panel).length))
 
 // ---------------------------------------------------------------------------
 // Withdrawing the History tab

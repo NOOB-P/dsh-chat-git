@@ -438,7 +438,7 @@ check('the revert button has an ordering', typeof actions?.options?.order === 'n
   String(actions?.options?.order))
 check('the settings page registers a section', settings !== undefined)
 check('the settings section id is chat-git', settings?.options?.id === 'chat-git', String(settings?.options?.id))
-check('the settings section carries a nav label', settings?.options?.label === '对话 Git',
+check('the settings section carries a nav label', settings?.options?.label === '仓库增强',
   String(settings?.options?.label))
 
 console.log('\n== the plugin stylesheet ==')
@@ -585,7 +585,7 @@ console.log('\n== the settings page renders ==')
 const sectionNode = ReactStub.createElement(settings.component, { close: () => {} })
 let section = render(sectionNode)
 const coldText = textOf(section)
-check('the section names the feature', coldText.includes('对话 Git'), JSON.stringify(coldText))
+check('the section names the feature', coldText.includes('仓库增强'), JSON.stringify(coldText))
 check('the section offers a detection control', coldText.includes('检测 Git'), JSON.stringify(coldText))
 check('the section offers the download jump', coldText.includes('下载 Git'), JSON.stringify(coldText))
 check('the section reports the checkpoint behaviour', coldText.includes('git init'), JSON.stringify(coldText))

@@ -354,6 +354,9 @@ const effects = []
 
 const forkedSessions = []
 
+/** The injection whose callback is currently running, if any. */
+let activeInjection = null
+
 const ctx = {
   sessions: {
     fork: async ({ sessionId, atSeq }) => {
@@ -373,16 +376,29 @@ const ctx = {
   },
   slots: {
     inject(name, callback) {
-      registrations.push({ injectName: name, pending: true })
+      const entry = { injectName: name, pending: true }
+      registrations.push(entry)
+      activeInjection = entry
       try {
         callback()
       } catch (error) {
-        registrations.at(-1).error = String(error)
+        entry.error = String(error)
+      } finally {
+        activeInjection = null
       }
       return () => {}
     },
     register(options, component) {
-      const entry = registrations.at(-1)
+      // Resolve the seat this call belongs to, in the order the real registry
+      // would: the injection that is running right now, else the injection that
+      // owns this slot name. The second case is not a convenience — the History
+      // tab re-registers itself from a store subscription, long after every
+      // `inject` callback has returned, and a stub that resolved with
+      // `registrations.at(-1)` filed that restore under the settings section,
+      // making the tab look permanently withdrawn.
+      const entry = activeInjection
+        ?? registrations.find((candidate) => candidate.injectName === options.name)
+        ?? registrations.at(-1)
       entry.options = options
       entry.component = component
       entry.pending = false
@@ -847,19 +863,8 @@ section = render(sectionNode)
 const restoreToggle = findAll(section, 'button').filter((btn) => btn.props?.role === 'switch')[1]
 check('the switch reads as off once the host confirmed', restoreToggle?.props?.['aria-checked'] === false,
   JSON.stringify(restoreToggle?.props?.['aria-checked']))
-console.log('DEBUG before restore', JSON.stringify({
-  disabled: restoreToggle?.props?.disabled,
-  on: restoreToggle?.props?.['aria-checked'],
-  disposed: conversationTab?.disposed,
-  calls: requests.filter((e) => e.url.startsWith('/chat-git/set')).map((e) => [e.url, e.body]),
-}))
 restoreToggle.props.onClick()
 await tick()
-await tick()
-console.log('DEBUG after restore', JSON.stringify({
-  disposed: conversationTab?.disposed,
-  calls: requests.filter((e) => e.url.startsWith('/chat-git/set')).map((e) => [e.url, e.body]),
-}))
 check('turning the tab back on restores the seat', conversationTab?.disposed === false,
   String(conversationTab?.disposed))
 check('the restored seat keeps its id and label',

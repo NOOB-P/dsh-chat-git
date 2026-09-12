@@ -239,6 +239,32 @@ const sentPrompts = []
 const archived = []
 
 /**
+ * Model routes the fake `/chat-git/set-model` route accepted, in order.
+ *
+ * Recorded rather than merely answered: the whole point of the picker is the
+ * *order* — the selection has to be written before `sessions.create`/`fork`,
+ * because both build their child from the default selection.
+ */
+const appliedModels = []
+
+/**
+ * How the fake `/chat-git/set-model` route refuses, when it should.
+ *
+ * Set to an error code to make the route refuse: a deployment whose model layer
+ * rejects the write must leave the conversation exactly where it was.
+ */
+let modelSwitchRefused = ''
+
+/**
+ * Ordered log of the writes that decide which model the rebuilt line runs on.
+ *
+ * The order is the whole point: `sessions.create`/`fork` take their route from
+ * the default selection, so a `/chat-git/set-model` that arrived *after* either
+ * call would leave the new line on the old model while looking correct.
+ */
+const modelOrder = []
+
+/**
  * The repository the fake host reports for the workspace pane.
  *
  * Deliberately its own data, not derived from `timelineTurns`: the two panes
@@ -269,6 +295,13 @@ let repoState = {
   git: { available: true, version: 'git version 2.54.0.windows.1', error: '' },
   branch: 'main',
   head: repoCommits[1].sha,
+  // Where the *worktree* stands, which is a different question from HEAD once a
+  // restore has happened: restoring leaves HEAD alone on purpose, so the host
+  // remembers the position itself. The fixture starts already restored to the
+  // first commit — the two differ on purpose, because a fixture where position
+  // and HEAD agree could not tell the marker apart from a plain HEAD highlight.
+  position: repoCommits[0].sha,
+  positionKnown: true,
   dirty: false,
   commits: repoCommits,
 }
@@ -334,7 +367,25 @@ globalThis.fetch = async (url, init) => {
         ? { ok: false, error: { code: 'bad-request', message: 'sessionId is required' } }
         : { ok: true, value: { ...repoState } }
   } else if (url === '/chat-git/restore') {
+    // Mirrors the host: the worktree moves while HEAD stays, so the position the
+    // pane marks is the restored commit and it is now a *known* position.
+    repoState = { ...repoState, position: body.sha, positionKnown: true }
     payload = { ok: true, value: { restored: body.sha, removed: ['extra.txt'] } }
+  } else if (url === '/chat-git/set-model') {
+    // Mirrors the host: the route validates against the live registry before it
+    // writes anything, so an unregistered route is refused rather than stored.
+    if (modelSwitchRefused !== '') {
+      payload = { ok: false, error: { code: modelSwitchRefused, message: modelSwitchRefused } }
+    } else if (body.provider === 'no-such-provider' || body.model === 'no-such-model') {
+      payload = {
+        ok: false,
+        error: { code: 'unknown-model', message: 'that model is not registered in this deployment' },
+      }
+    } else {
+      appliedModels.push({ provider: body.provider, model: body.model })
+      modelOrder.push('set-model')
+      payload = { ok: true, value: { provider: body.provider, model: body.model } }
+    }
   } else if (url === '/chat-git/models') {
     payload = {
       ok: true,
@@ -466,10 +517,12 @@ const ctx = {
   sessions: {
     fork: async ({ sessionId, atSeq }) => {
       forkedSessions.push({ sessionId, atSeq })
+      modelOrder.push('fork')
       return 'session-fork-9'
     },
     create: async (opts = {}) => {
       createdSessions.push(opts)
+      modelOrder.push('create')
       return 'session-new-7'
     },
     open: () => {},
@@ -1041,6 +1094,42 @@ check('the resend dialog never offers fork or rewind',
   !findAll(dialogOf(panel), 'button').some((btn) => /fork|回退/.test(textOf(btn))),
   JSON.stringify(findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))))
 
+console.log('\n== the resend dialog lets the model be re-picked ==')
+// Choosing a model is part of this dialog rather than a separate step: the
+// rebuilt line runs on the deployment's default selection, so the choice has to
+// be written before the session is created or forked — a picker shown after the
+// fact would be describing a decision that was already made.
+const picker = findAll(dialogOf(panel), 'select')[0]
+check('the dialog offers a model picker', picker !== undefined,
+  JSON.stringify(findAll(dialogOf(panel), 'select').length))
+check('the picker is labelled for assistive tech',
+  picker?.props?.['aria-label'] === '重新发送使用的模型', String(picker?.props?.['aria-label']))
+check('the picker lists one option per registered model',
+  (picker?.props?.children ?? []).length === 2,
+  JSON.stringify((picker?.props?.children ?? []).map((option) => option?.props?.value)))
+check('an option names both the provider and the model',
+  textOf((picker?.props?.children ?? [])[0]) === 'DeepSeek / V4 Flash',
+  JSON.stringify(textOf((picker?.props?.children ?? [])[0])))
+// Seeded with the route the deployment would use anyway, so the control reads as
+// "change this if you want" rather than as a question that must be answered.
+check('the picker is seeded with the current route', picker?.props?.value === '0',
+  String(picker?.props?.value))
+check('a provider with no models contributes no option',
+  !(picker?.props?.children ?? []).some((option) => textOf(option).includes('Bare')),
+  JSON.stringify((picker?.props?.children ?? []).map((option) => textOf(option))))
+// The catalogue read happens while the dialog opens, alongside the whole-prompt
+// read: a picker that populated itself a moment later would look like a failure.
+check('the model list is read before the dialog is usable',
+  requests.some((entry) => entry.url === '/chat-git/models'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/models').length))
+picker?.props?.onChange({ target: { value: '1' } })
+panel = render(panelNode)
+check('choosing another model updates the picker',
+  findAll(dialogOf(panel), 'select')[0]?.props?.value === '1',
+  String(findAll(dialogOf(panel), 'select')[0]?.props?.value))
+check('choosing a model sends nothing on its own',
+  appliedModels.length === 0, JSON.stringify(appliedModels))
+
 console.log('\n== an emptied prompt cannot be resent ==')
 // An empty box is the one way this dialog can be refused, and it must be
 // refused *before* the conversation moves: sending nothing after truncating
@@ -1078,6 +1167,17 @@ check('the first turn resends into a newly created session',
   JSON.stringify({ created: createdSessions, forks: forkedSessions.slice(beforeEmptyFork) }))
 check('the new session keeps the conversation workspace',
   createdSessions[0]?.cwd === 'C:/ws', JSON.stringify(createdSessions[0]))
+// The model has to be written *before* the session is built: `sessions.create`
+// and `sessions.fork` both take their route from the default selection, so a
+// switch that arrived afterwards would leave the new line on the old model.
+check('the chosen model is written before the conversation moves',
+  appliedModels.length === 1 && appliedModels[0].provider === 'deepseek-official'
+  && appliedModels[0].model === 'deepseek-v4-pro',
+  JSON.stringify(appliedModels))
+check('the model switch happens before the session is built',
+  modelOrder.indexOf('set-model') >= 0
+  && modelOrder.indexOf('set-model') < modelOrder.indexOf('create'),
+  JSON.stringify(modelOrder))
 check('the edited prompt is what gets sent', sentPrompts.at(-1) === editedFirst,
   JSON.stringify(sentPrompts))
 check('the edited text is trimmed before it is sent',
@@ -1248,29 +1348,90 @@ check('every commit row offers exactly one action',
 check('the restore button is labelled as such',
   textOf(findAll(restoreRows[1], 'button')[0]) === '还原到这里',
   JSON.stringify(textOf(findAll(restoreRows[1], 'button')[0])))
-// Two steps, exactly like the per-turn icon button: the first click only arms.
+// Confirmation is a dialog, not a second click on the same button: the sentence
+// that has to be read before overwriting a worktree ("this is what you lose")
+// does not fit in a list row, and an armed button leaves it unsaid.
+const beforeDialogRestore = requests.filter((entry) => entry.url === '/chat-git/restore').length
 findAll(restoreRows[1], 'button')[0].props.onClick()
 panel = render(panelNode)
-const armedRow = commitsOf(panel)[1]
-check('the first click arms instead of restoring',
-  !requests.some((entry) => entry.url === '/chat-git/restore'),
+const restoreDialogNode = dialogOf(panel)
+check('clicking 还原 opens a confirmation dialog',
+  restoreDialogNode !== undefined, JSON.stringify(findAll(panel, 'div').length))
+check('opening the dialog restores nothing yet',
+  requests.filter((entry) => entry.url === '/chat-git/restore').length === beforeDialogRestore,
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/restore').map((entry) => entry.body)))
-check('the armed row asks for confirmation',
-  textOf(findAll(armedRow, 'button')[0]) === '再点一次确认还原',
-  JSON.stringify(textOf(findAll(armedRow, 'button')[0])))
-check('the armed row offers a way back', textOf(armedRow).includes('取消'), JSON.stringify(textOf(armedRow)))
-findAll(armedRow, 'button')[0].props.onClick()
+const restoreDialogText = textOf(restoreDialogNode)
+// The dialog names the commit itself: "还原到这里" is only unambiguous while the
+// row is still on screen, so the confirmation has to stand on its own.
+check('the dialog names the commit being restored',
+  restoreDialogText.includes(repoCommits[1].short) && restoreDialogText.includes('把登录返回值改成 ok'),
+  JSON.stringify(restoreDialogText.slice(-320)))
+check('the dialog says HEAD is not moved',
+  restoreDialogText.includes('HEAD 不动'), JSON.stringify(restoreDialogText.slice(-320)))
+check('the dialog warns that untracked files are left alone',
+  restoreDialogText.includes('未跟踪'), JSON.stringify(restoreDialogText.slice(-320)))
+check('the dialog says where the worktree stands now and where it will be',
+  restoreDialogText.includes('当前位置') && restoreDialogText.includes('还原后变成'),
+  JSON.stringify(restoreDialogText.slice(-320)))
+const restoreLabels = findAll(restoreDialogNode, 'button').map((btn) => textOf(btn))
+check('the restore dialog confirms with its own wording',
+  restoreLabels.join('|') === '确认还原|取消', JSON.stringify(restoreLabels))
+// Cancelling must be a real way out, not just a label: the dialog closes and no
+// request is issued.
+findAll(restoreDialogNode, 'button')[1].props.onClick()
+panel = render(panelNode)
+check('cancelling closes the dialog without restoring',
+  dialogOf(panel) === undefined
+  && requests.filter((entry) => entry.url === '/chat-git/restore').length === beforeDialogRestore,
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/restore').map((entry) => entry.body)))
+
+findAll(commitsOf(panel)[1], 'button')[0].props.onClick()
+panel = render(panelNode)
+findAll(dialogOf(panel), 'button')[0].props.onClick()
 await tick()
 await tick()
 await tick()
 const restoreCalls = requests.filter((entry) => entry.url === '/chat-git/restore')
-check('the second click restores that commit',
+check('confirming in the dialog restores that commit',
   restoreCalls.length === 1 && restoreCalls[0].body.sha === repoCommits[1].sha,
   JSON.stringify(restoreCalls.map((entry) => entry.body)))
 check('restoring code forks no conversation', forkedSessions.length === beforeRestoreForks,
   JSON.stringify(forkedSessions))
 check('restoring code archives no conversation', archived.length === beforeRestoreArchived,
   JSON.stringify(archived))
+
+console.log('\n== the pane marks where the worktree stands ==')
+// A restore deliberately leaves HEAD alone, so after one git alone can no longer
+// answer "where am I": the host remembers the position, and the pane has to show
+// it as a label rather than leaving the user to compare shas by eye.
+panel = render(panelNode)
+await tick()
+panel = render(panelNode)
+const markedRows = commitsOf(panel)
+const restoredRow = markedRows.find((row) => row.props?.['data-current'] === 'true')
+check('the row the worktree stands on is tagged',
+  restoredRow !== undefined && textOf(restoredRow).includes(repoCommits[1].short),
+  JSON.stringify(markedRows.map((row) => row.props?.['data-current'])))
+check('that row carries a 当前位置 label',
+  findAll(restoredRow ?? null, 'span')
+    .some((span) => String(span.props?.className ?? '').includes('dsh-chat-git-here')
+      && textOf(span) === '当前位置'),
+  JSON.stringify(findAll(restoredRow ?? null, 'span').map((span) => [span.props?.className, textOf(span)])))
+check('only one row is marked as the current position',
+  markedRows.filter((row) => row.props?.['data-current'] === 'true').length === 1,
+  JSON.stringify(markedRows.map((row) => row.props?.['data-current'])))
+// Restoring onto the position the worktree already holds would be a no-op that
+// still reports success, so that row's button is refused rather than offered.
+check('the current row refuses a no-op restore',
+  textOf(findAll(restoredRow ?? null, 'button')[0]) === '已在此位置'
+  && findAll(restoredRow ?? null, 'button')[0].props?.disabled === true,
+  JSON.stringify(textOf(findAll(restoredRow ?? null, 'button')[0])))
+check('a row that is not the current position still offers 还原到这里',
+  textOf(findAll(markedRows[0], 'button')[0]) === '还原到这里'
+  && findAll(markedRows[0], 'button')[0].props?.disabled === false,
+  JSON.stringify(textOf(findAll(markedRows[0], 'button')[0])))
+check('the pane states the position in words as well',
+  textOf(panel).includes('当前位置：bbbb222'), JSON.stringify(textOf(panel).slice(-320)))
 
 // ---------------------------------------------------------------------------
 // A failed workspace read
@@ -1299,11 +1460,20 @@ const settleRead = async () => {
   await tick()
   panel = render(panelNode)
 }
-// A successful restore bumps the revision, which is what re-runs the read.
-findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
-panel = render(panelNode)
-findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
-await settleRead()
+/**
+ * Restore one row through the dialog, which is what bumps the revision.
+ *
+ * The re-read this block needs lives in an effect keyed on the revision, and a
+ * successful restore is what advances it — so the block has to go through the
+ * real two-step confirmation rather than poking at state directly.
+ */
+const restoreRow = async (index) => {
+  findAll(commitsOf(panel)[index], 'button')[0].props.onClick()
+  panel = render(panelNode)
+  findAll(dialogOf(panel), 'button')[0].props.onClick()
+  await settleRead()
+}
+await restoreRow(0)
 const failedText = textOf(panel)
 check('the host\'s own words are surfaced instead of a generic failure',
   failedText.includes('not found'), JSON.stringify(failedText.slice(-300)))
@@ -1324,10 +1494,10 @@ check('the error is cleared once the read succeeds', !textOf(panel).includes('no
 // A host that serves no such route at all looks like a rejected fetch, and the
 // transport message is the honest thing to show for it.
 repoUnreachable = true
-findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
-panel = render(panelNode)
-findAll(commitsOf(panel)[0], 'button')[0].props.onClick()
-await settleRead()
+// Row 1 rather than row 0: the restore above moved the position, so row 0 is now
+// the current one and its button is refused. Restoring a row that is genuinely
+// offered is what bumps the revision this read hangs off.
+await restoreRow(1)
 check('an unreachable route reports the transport, not the repository',
   textOf(panel).includes('路由不可用'), JSON.stringify(textOf(panel).slice(-300)))
 repoUnreachable = false

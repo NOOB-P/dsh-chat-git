@@ -271,7 +271,7 @@ const SESSION = 'session-test-1'
 
 const { apply } = await import(new URL('../lib/index.js', import.meta.url).href)
 const { buildSummaryInput, cleanSummary } = await import(new URL('../lib/summarize.js', import.meta.url).href)
-const { buildTimeline } = await import(new URL('../lib/timeline.js', import.meta.url).href)
+const { buildTimeline, turnPrompt } = await import(new URL('../lib/timeline.js', import.meta.url).href)
 
 console.log('\n== folding a session log into a turn journal ==')
 const folded = buildTimeline([
@@ -889,6 +889,65 @@ try {
   const noTimelineId = await call(aiServer.base, '/chat-git/timeline', {})
   check('the timeline needs a sessionId',
     noTimelineId.ok === false && noTimelineId.error.code === 'bad-request', JSON.stringify(noTimelineId))
+
+  console.log('\n== the turn-prompt route keeps the whole prompt ==')
+  // The panel renders a clipped card, but 编辑并重新发送 hands this text back to
+  // the model: resending a clip would quietly ask for something the user never
+  // wrote. A 600-character prompt is what makes the distinction observable —
+  // the timeline answer clips it, and this route must not.
+  const longTurnPrompt = `开头${'x'.repeat(600)}结尾`
+  sessionLogs.set('session-long', [
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: longTurnPrompt }] } },
+    { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ])
+  const fullPrompt = (await call(aiServer.base, '/chat-git/turn-prompt',
+    { sessionId: 'session-long', turn: 1 })).value
+  check('the route returns the whole prompt', fullPrompt?.prompt === longTurnPrompt,
+    JSON.stringify(String(fullPrompt?.prompt).length))
+  check('the returned prompt is longer than the display clip',
+    String(fullPrompt?.prompt).length > 300, String(String(fullPrompt?.prompt).length))
+  check('the route echoes the turn it answered for', fullPrompt?.turn === 1, JSON.stringify(fullPrompt?.turn))
+  const clippedPrompt = (await call(aiServer.base, '/chat-git/timeline',
+    { sessionId: 'session-long' })).value.turns[0].prompt
+  check('the timeline answer stays clipped for display',
+    clippedPrompt.length <= 300 && clippedPrompt !== longTurnPrompt, String(clippedPrompt.length))
+
+  const noPromptTurn = await call(aiServer.base, '/chat-git/turn-prompt',
+    { sessionId: 'session-long', turn: 99 })
+  check('a turn the conversation never had is refused',
+    noPromptTurn.ok === false && noPromptTurn.error.code === 'turn-unknown', JSON.stringify(noPromptTurn))
+  const badTurn = await call(aiServer.base, '/chat-git/turn-prompt', { sessionId: 'session-long' })
+  check('the route needs a whole turn number',
+    badTurn.ok === false && badTurn.error.code === 'bad-request', JSON.stringify(badTurn))
+  const noPromptSession = await call(aiServer.base, '/chat-git/turn-prompt', { sessionId: '', turn: 1 })
+  check('the route needs a sessionId',
+    noPromptSession.ok === false && noPromptSession.error.code === 'bad-request', JSON.stringify(noPromptSession))
+  const unloadedPrompt = await call(aiServer.base, '/chat-git/turn-prompt',
+    { sessionId: 'session-not-loaded', turn: 1 })
+  check('a conversation that is not loaded is reported here too',
+    unloadedPrompt.ok === false && unloadedPrompt.error.code === 'session-unavailable',
+    JSON.stringify(unloadedPrompt))
+
+  console.log('\n== turnPrompt reads one turn out of a log ==')
+  check('the whole prompt is returned unclipped',
+    turnPrompt(sessionLogs.get('session-long'), 1) === longTurnPrompt,
+    String(String(turnPrompt(sessionLogs.get('session-long'), 1)).length))
+  check('an unknown turn answers null', turnPrompt(sessionLogs.get('session-long'), 7) === null,
+    JSON.stringify(turnPrompt(sessionLogs.get('session-long'), 7)))
+  check('a log that is not an array answers null', turnPrompt(undefined, 1) === null,
+    JSON.stringify(turnPrompt(undefined, 1)))
+  check('the first user message stays the prompt, not the steering one',
+    turnPrompt([
+      { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+      { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '原始请求' }] } },
+      { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '插话' }] } },
+    ], 1) === '原始请求',
+    JSON.stringify(turnPrompt([
+      { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+      { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '原始请求' }] } },
+      { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '插话' }] } },
+    ], 1)))
 
   console.log('\n== the workspace pane reads the repository on its own route ==')
   // The whole point of the split: this answer never mentions a turn, and the

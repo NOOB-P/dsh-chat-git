@@ -219,6 +219,22 @@ let timelineTurns = [
   { turn: 3, at: 0, prompt: '正在进行的一轮', seq: null, steps: 0, endReason: '', commit: null },
 ]
 
+/**
+ * The whole prompt behind each turn, as `/chat-git/turn-prompt` serves it.
+ *
+ * Deliberately different from the `prompt` on {@link timelineTurns}: that one is
+ * the display clip, and a resend that quietly sent the clip instead of the whole
+ * prompt is exactly the bug this separation makes observable.
+ */
+const wholePrompts = {
+  1: '实现登录接口，并且把返回值统一改成 { ok: true } 的形式，另外记得补上失败分支的测试。',
+  2: '把登录返回值改成 ok，并且为失败分支补一个单元测试。',
+  3: '正在进行的一轮',
+}
+
+/** Prompts the fake conversation service was asked to send, in order. */
+const sentPrompts = []
+
 /** Sessions the fake workspace service archived. */
 const archived = []
 
@@ -304,6 +320,10 @@ globalThis.fetch = async (url, init) => {
     }
   } else if (url === '/chat-git/timeline') {
     payload = { ok: true, value: { cwd: 'C:/ws', turns: timelineTurns } }
+  } else if (url === '/chat-git/turn-prompt') {
+    // The whole prompt, unclipped — deliberately longer than the card's clip so
+    // a resend that used the displayed prompt instead would be visible.
+    payload = { ok: true, value: { turn: body.turn, prompt: wholePrompts[body.turn] ?? '' } }
   } else if (url === '/chat-git/repo') {
     if (repoUnreachable) throw new Error('route not mounted')
     // Mirrors the host: an empty sessionId is refused, because the workspace
@@ -427,6 +447,18 @@ const effects = []
 
 const forkedSessions = []
 
+/** Sessions the plugin asked the host to create outright (a first-turn resend). */
+const createdSessions = []
+
+/**
+ * Whether the fake deployment mounts the conversation controller.
+ *
+ * The resend prefers `ctx.conversation.send` and falls back to the session
+ * face's own `prompt`; flipping this is what exercises the second path, so the
+ * fallback is covered rather than merely written.
+ */
+let conversationAvailable = true
+
 /** The injection whose callback is currently running, if any. */
 let activeInjection = null
 
@@ -436,7 +468,27 @@ const ctx = {
       forkedSessions.push({ sessionId, atSeq })
       return 'session-fork-9'
     },
+    create: async (opts = {}) => {
+      createdSessions.push(opts)
+      return 'session-new-7'
+    },
     open: () => {},
+    /** The scope-addressed hop the resend takes to reach `conversation`. */
+    scope: () => (conversationAvailable
+      ? {
+        get: (name) => (name === 'conversation'
+          ? { send: async (text) => { sentPrompts.push(text) } }
+          : undefined),
+      }
+      : undefined),
+    binding: () => ({
+      session: {
+        prompt: async (content) => {
+          sentPrompts.push(content[0].text)
+          return { ok: true, value: { accepted: true } }
+        },
+      },
+    }),
   },
   /** Optional services the plugin probes rather than injecting. */
   get(name) {
@@ -873,6 +925,16 @@ await tick()
 let panel = render(panelNode)
 const cardsOf = (tree) => findAll(tree, 'div')
   .filter((node) => String(node.props?.className ?? '').includes('dsh-chat-git-card'))
+/**
+ * The confirm dialog, read out of its own node.
+ *
+ * The dialog is a child of the panel, so collecting every button in the panel
+ * would also pick up the card buttons, whose wording ("从这里 fork" /
+ * "回退到这里") legitimately names the same verbs and would drown out the
+ * assertion about what the dialog itself offers.
+ */
+const dialogOf = (tree) => findAll(tree, 'div')
+  .find((node) => String(node.props?.className ?? '').includes('dsh-chat-git-dialog'))
 check('the panel read the conversation timeline',
   requests.some((entry) => entry.url === '/chat-git/timeline' && entry.body.sessionId === 'session-live-1'),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/timeline').map((entry) => entry.body)))
@@ -927,12 +989,13 @@ check('the workspace pane reports the branch and the repository root',
 check('the workspace pane reports a clean worktree', panelText.includes('工作区干净'),
   JSON.stringify(panelText.slice(-320)))
 
-console.log('\n== each card offers both branch actions ==')
-check('every card carries exactly the two buttons',
-  cards.every((card) => findAll(card, 'button').length === 2),
+console.log('\n== each card offers all three conversation actions ==')
+check('every card carries exactly the three buttons',
+  cards.every((card) => findAll(card, 'button').length === 3),
   JSON.stringify(cards.map((card) => findAll(card, 'button').length)))
 check('the buttons are labelled as asked',
-  findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|') === '从这里 fork|回退到这里',
+  findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|')
+    === '从这里 fork|回退到这里|编辑并重新发送',
   findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|'))
 check('a turn with no closing sequence cannot branch',
   findAll(cards[2], 'button').every((btn) => btn.props?.disabled === true),
@@ -940,13 +1003,148 @@ check('a turn with no closing sequence cannot branch',
 check('the panel explains why that turn cannot branch',
   panelText.includes('没有结束序列'), JSON.stringify(panelText.slice(-200)))
 
+console.log('\n== the resend editor is seeded from the whole prompt ==')
+// The card shows a *clip* of the prompt — `/chat-git/timeline` truncates it for
+// display. Resending that clip would quietly ask the model for something the
+// user never wrote, so the editor has to be seeded from the separate whole-prompt
+// read, and the fake host gives the two deliberately different text.
+findAll(cards[0], 'button')[2].props.onClick()
+await tick()
+panel = render(panelNode)
+const editorOf = (tree) => findAll(tree, 'textarea')[0]
+const editor = editorOf(panel)
+check('clicking the third action opens an editor',
+  editor !== undefined, JSON.stringify(findAll(panel, 'textarea').length))
+check('the whole prompt is read from the host, not the card',
+  requests.some((entry) => entry.url === '/chat-git/turn-prompt'
+    && entry.body.sessionId === 'session-live-1' && entry.body.turn === 1),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/turn-prompt').map((entry) => entry.body)))
+check('the editor is seeded with the whole prompt',
+  editor?.props?.value === wholePrompts[1], JSON.stringify(editor?.props?.value))
+check('the seeded text is longer than the card\'s clip',
+  String(editor?.props?.value ?? '').length > String(cards[0] && textOf(cards[0])).length
+  && editor?.props?.value !== timelineTurns[0].prompt,
+  JSON.stringify({ seeded: editor?.props?.value, card: timelineTurns[0].prompt }))
+check('the editor is labelled for assistive tech', editor?.props?.['aria-label'] === '编辑提示词',
+  String(editor?.props?.['aria-label']))
+const resendDialogText = textOf(dialogOf(panel))
+check('the resend dialog names the turn', resendDialogText.includes('第 1 轮'),
+  JSON.stringify(resendDialogText.slice(-320)))
+check('the resend dialog says the later turns go away',
+  resendDialogText.includes('删掉这一轮及其之后'), JSON.stringify(resendDialogText.slice(-320)))
+check('the resend dialog says the original is archived',
+  resendDialogText.includes('归档'), JSON.stringify(resendDialogText.slice(-320)))
+check('the resend dialog confirms with its own wording',
+  findAll(dialogOf(panel), 'button').map((btn) => textOf(btn)).join('|') === '删除并重新发送|取消',
+  findAll(dialogOf(panel), 'button').map((btn) => textOf(btn)).join('|'))
+check('the resend dialog never offers fork or rewind',
+  !findAll(dialogOf(panel), 'button').some((btn) => /fork|回退/.test(textOf(btn))),
+  JSON.stringify(findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))))
+
+console.log('\n== an emptied prompt cannot be resent ==')
+// An empty box is the one way this dialog can be refused, and it must be
+// refused *before* the conversation moves: sending nothing after truncating
+// would destroy turns for no reason.
+const beforeEmptyFork = forkedSessions.length
+const beforeEmptyCreate = createdSessions.length
+editorOf(panel).props.onChange({ target: { value: '   ' } })
+panel = render(panelNode)
+const emptiedConfirm = findAll(dialogOf(panel), 'button')[0]
+check('an emptied editor disables the confirm', emptiedConfirm?.props?.disabled === true,
+  String(emptiedConfirm?.props?.disabled))
+check('the dialog says why it is refused', textOf(dialogOf(panel)).includes('提示词不能为空'),
+  JSON.stringify(textOf(dialogOf(panel)).slice(-200)))
+emptiedConfirm.props.onClick()
+await tick()
+check('a refused resend moves no conversation',
+  forkedSessions.length === beforeEmptyFork && createdSessions.length === beforeEmptyCreate,
+  JSON.stringify({ forks: forkedSessions.length, created: createdSessions.length }))
+
+console.log('\n== resending the first turn starts a fresh session ==')
+// Turn 1 has no turn before it, so there is no boundary to fork at: forking at
+// nothing would keep the whole conversation. A new session in the same
+// workspace is the honest expression of "nothing before this turn is kept".
+archived.length = 0
+sentPrompts.length = 0
+const editedFirst = '实现登录接口，返回值统一改成 ok，并补上失败分支的测试。'
+editorOf(panel).props.onChange({ target: { value: editedFirst } })
+panel = render(panelNode)
+findAll(dialogOf(panel), 'button')[0].props.onClick()
+await tick()
+await tick()
+await tick()
+check('the first turn resends into a newly created session',
+  createdSessions.length === 1 && forkedSessions.length === beforeEmptyFork,
+  JSON.stringify({ created: createdSessions, forks: forkedSessions.slice(beforeEmptyFork) }))
+check('the new session keeps the conversation workspace',
+  createdSessions[0]?.cwd === 'C:/ws', JSON.stringify(createdSessions[0]))
+check('the edited prompt is what gets sent', sentPrompts.at(-1) === editedFirst,
+  JSON.stringify(sentPrompts))
+check('the edited text is trimmed before it is sent',
+  sentPrompts.at(-1) === editedFirst.trim(), JSON.stringify(sentPrompts.at(-1)))
+check('the original conversation is archived',
+  archived.length === 1 && archived[0] === 'session-live-1', JSON.stringify(archived))
+check('a first-turn resend inherits nothing, because nothing survives',
+  !requests.some((entry) => entry.url === '/chat-git/inherit'
+    && entry.body.to === 'session-new-7'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
+
+console.log('\n== resending a later turn forks at the turn before it ==')
+// The boundary belongs to the turn *before* the edited one — the edited turn and
+// everything after it are what disappear.
+panel = render(panelNode)
+await tick()
+panel = render(panelNode)
+const beforeLaterFork = forkedSessions.length
+const beforeLaterCreate = createdSessions.length
+const beforeLaterArchived = archived.length
+sentPrompts.length = 0
+findAll(cardsOf(panel)[1], 'button')[2].props.onClick()
+await tick()
+panel = render(panelNode)
+const laterEditor = findAll(panel, 'textarea')[0]
+check('the editor is seeded from that turn\'s own prompt',
+  laterEditor?.props?.value === wholePrompts[2], JSON.stringify(laterEditor?.props?.value))
+findAll(dialogOf(panel), 'button')[0].props.onClick()
+await tick()
+await tick()
+await tick()
+check('the later turn forks instead of creating',
+  forkedSessions.length === beforeLaterFork + 1 && createdSessions.length === beforeLaterCreate,
+  JSON.stringify({ forks: forkedSessions.slice(beforeLaterFork), created: createdSessions.slice(beforeLaterCreate) }))
+check('the fork boundary is the turn before the edited one',
+  forkedSessions.at(-1)?.atSeq === 10, JSON.stringify(forkedSessions.at(-1)))
+check('the surviving checkpoints go to the new line',
+  requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.turn === 1),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
+check('the unedited prompt is resent as it stands', sentPrompts.at(-1) === wholePrompts[2],
+  JSON.stringify(sentPrompts))
+check('the second resend archives its original too',
+  archived.length === beforeLaterArchived + 1, JSON.stringify(archived))
+
+console.log('\n== a deployment without the conversation service still resends ==')
+// `ctx.conversation` and this plugin are separate packages, so the resend keeps
+// a real second path rather than assuming the controller is mounted.
+conversationAvailable = false
+panel = render(panelNode)
+await tick()
+panel = render(panelNode)
+sentPrompts.length = 0
+findAll(cardsOf(panel)[0], 'button')[2].props.onClick()
+await tick()
+panel = render(panelNode)
+findAll(dialogOf(panel), 'button')[0].props.onClick()
+await tick()
+await tick()
+await tick()
+check('the session face carries the prompt when the controller is absent',
+  sentPrompts.at(-1) === wholePrompts[1], JSON.stringify(sentPrompts))
+conversationAvailable = true
+panel = render(panelNode)
+await tick()
+panel = render(panelNode)
+
 console.log('\n== the dialog asks only about the conversation ==')
-// The dialog is a child of the panel, so its buttons have to be read out of the
-// dialog node itself: collecting every button in the panel would also pick up
-// the card buttons, whose wording ("从这里 fork" / "回退到这里") legitimately
-// names both verbs and would drown out the assertion.
-const dialogOf = (tree) => findAll(tree, 'div')
-  .find((node) => String(node.props?.className ?? '').includes('dsh-chat-git-dialog'))
 findAll(cards[1], 'button')[0].props.onClick()
 panel = render(panelNode)
 const dialogLabels = findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))

@@ -235,12 +235,16 @@ const llmStub = {
   },
 }
 
-/** Every selection the resend's model picker wrote, in order. */
-const modelSelections = []
-
+/**
+ * The deployment's default model route.
+ *
+ * Only the *read* is exercised now: 编辑并发送 hands the request to the new
+ * composer instead of sending it, so nothing here chooses the route of a new
+ * line before it is built — the shell's own model picker is the only thing that
+ * decides which model a prompt runs on.
+ */
 const modelRouteStub = {
   currentSelection: () => ({ provider: 'fake-provider', model: 'fake-model', reasoningEffort: 'low' }),
-  saveSelection: async (selection) => { modelSelections.push(selection) },
 }
 
 /** Session logs the fake `sessions` service serves, keyed by session id. */
@@ -354,7 +358,7 @@ check('the whole-prompt read skips a compaction checkpoint too',
     checkpointMessage(2, 'c2'),
     { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '真实请求' }] } },
     { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
-  ], 1) === '真实请求',
+  ], 1)?.text === '真实请求',
   JSON.stringify(turnPrompt([
     { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
     checkpointMessage(2, 'c2'),
@@ -918,38 +922,20 @@ try {
   check('the catalogue is cached rather than re-probed each time',
     Date.now() - cachedCatalogue < 1000, `${String(Date.now() - cachedCatalogue)}ms`)
 
-  console.log('\n== a resend can pick the model it runs on ==')
-  // `session.create` and `session.fork` build their child from the default
-  // selection, so writing that selection *before* either call is what makes the
-  // new line run the chosen model. Validating against the live catalogue is the
-  // other half: a route this deployment cannot serve would otherwise fail much
-  // later, with the conversation already moved.
-  modelSelections.length = 0
-  const pickedModel = await call(aiServer.base, '/chat-git/set-model',
+  console.log('\n== the model-switch route is gone ==')
+  // 编辑并发送 no longer sends anything, so no route has to choose the model of
+  // a line before it is built: the request lands in a composer that runs on
+  // whatever the shell's own picker says, exactly like a typed prompt. The
+  // route is asserted absent rather than merely unused, because a leftover
+  // writer here would mean a card action could still move a global preference
+  // behind the model picker's back.
+  const removedSwitch = await call(aiServer.base, '/chat-git/set-model',
     { provider: 'fake-provider', model: 'tiny-model' })
-  check('a registered route is accepted',
-    pickedModel.ok === true && pickedModel.value.model === 'tiny-model', JSON.stringify(pickedModel))
-  check('the choice is written as the default selection',
-    modelSelections.length === 1 && modelSelections[0].provider === 'fake-provider'
-    && modelSelections[0].model === 'tiny-model',
-    JSON.stringify(modelSelections))
-  const noModel = await call(aiServer.base, '/chat-git/set-model', { provider: 'fake-provider' })
-  check('a switch without a model is refused',
-    noModel.ok === false && noModel.error.code === 'bad-request', JSON.stringify(noModel))
-  const noProvider = await call(aiServer.base, '/chat-git/set-model', { provider: '', model: 'tiny-model' })
-  check('a switch without a provider is refused',
-    noProvider.ok === false && noProvider.error.code === 'bad-request', JSON.stringify(noProvider))
-  const unregistered = await call(aiServer.base, '/chat-git/set-model',
-    { provider: 'fake-provider', model: 'not-a-model' })
-  check('a model this deployment does not register is refused',
-    unregistered.ok === false && unregistered.error.code === 'unknown-model', JSON.stringify(unregistered))
-  const unknownProvider = await call(aiServer.base, '/chat-git/set-model',
-    { provider: 'no-such-provider', model: 'fake-model' })
-  check('a provider this deployment does not register is refused',
-    unknownProvider.ok === false && unknownProvider.error.code === 'unknown-model',
-    JSON.stringify(unknownProvider))
-  check('a refused switch writes nothing',
-    modelSelections.length === 1, JSON.stringify(modelSelections))
+  // The web server's own 404 body has no `ok` field at all — it is the shell's
+  // shape, not this plugin's envelope — so its absence *is* the evidence that
+  // the route is gone rather than answering.
+  check('the model-switch route is no longer served',
+    removedSwitch.ok === undefined && removedSwitch.error === 'not found', JSON.stringify(removedSwitch))
 
   console.log('\n== the timeline route ==')
   // A fresh session so the commit join is deterministic: turn 1 will have a
@@ -996,11 +982,12 @@ try {
   check('the timeline needs a sessionId',
     noTimelineId.ok === false && noTimelineId.error.code === 'bad-request', JSON.stringify(noTimelineId))
 
-  console.log('\n== the turn-prompt route keeps the whole prompt ==')
-  // The panel renders a clipped card, but 编辑并重新发送 hands this text back to
-  // the model: resending a clip would quietly ask for something the user never
-  // wrote. A 600-character prompt is what makes the distinction observable —
-  // the timeline answer clips it, and this route must not.
+  console.log('\n== the turn-prompt route keeps the whole request ==')
+  // The panel renders a clipped card, but 编辑并发送 hands this request to the new
+  // session's composer: passing a clip through would quietly ask the user to send
+  // something they never wrote. A 600-character prompt is what makes the
+  // distinction observable — the timeline answer clips it, and this route must
+  // not. The images ride along as handles for the same reason.
   const longTurnPrompt = `开头${'x'.repeat(600)}结尾`
   sessionLogs.set('session-long', [
     { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
@@ -1009,11 +996,13 @@ try {
   ])
   const fullPrompt = (await call(aiServer.base, '/chat-git/turn-prompt',
     { sessionId: 'session-long', turn: 1 })).value
-  check('the route returns the whole prompt', fullPrompt?.prompt === longTurnPrompt,
-    JSON.stringify(String(fullPrompt?.prompt).length))
+  check('the route returns the whole prompt', fullPrompt?.text === longTurnPrompt,
+    JSON.stringify(String(fullPrompt?.text).length))
   check('the returned prompt is longer than the display clip',
-    String(fullPrompt?.prompt).length > 300, String(String(fullPrompt?.prompt).length))
+    String(fullPrompt?.text).length > 300, String(String(fullPrompt?.text).length))
   check('the route echoes the turn it answered for', fullPrompt?.turn === 1, JSON.stringify(fullPrompt?.turn))
+  check('a text-only turn reports no images',
+    Array.isArray(fullPrompt?.images) && fullPrompt.images.length === 0, JSON.stringify(fullPrompt?.images))
   const clippedPrompt = (await call(aiServer.base, '/chat-git/timeline',
     { sessionId: 'session-long' })).value.turns[0].prompt
   check('the timeline answer stays clipped for display',
@@ -1035,20 +1024,73 @@ try {
     unloadedPrompt.ok === false && unloadedPrompt.error.code === 'session-unavailable',
     JSON.stringify(unloadedPrompt))
 
+  // The images travel with the text, because a prompt whose pictures were
+  // dropped is a different prompt: the rebuilt line would start from a question
+  // the user never asked. Only the durable handle crosses — the browser half
+  // re-reads the bytes through the *source* session's own authorization, so the
+  // route must not start shipping image data itself.
+  sessionLogs.set('session-image', [
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    {
+      type: 'user/message',
+      seq: 2,
+      time: 2,
+      data: {
+        content: [
+          { type: 'text', text: '看看这张图' },
+          {
+            type: 'image',
+            attachment: { attachmentId: 'att-1', mediaType: 'image/png', bytes: 12, width: 2, height: 2 },
+          },
+        ],
+      },
+    },
+    { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ])
+  const withImage = (await call(aiServer.base, '/chat-git/turn-prompt',
+    { sessionId: 'session-image', turn: 1 })).value
+  check('the route hands over the prompt and its images together',
+    withImage?.text === '看看这张图' && withImage?.images?.length === 1
+    && withImage.images[0].attachmentId === 'att-1',
+    JSON.stringify(withImage))
+  check('an image handle carries nothing but its id',
+    JSON.stringify(Object.keys(withImage?.images?.[0] ?? {})) === '["attachmentId"]',
+    JSON.stringify(Object.keys(withImage?.images?.[0] ?? {})))
+
   console.log('\n== turnPrompt reads one turn out of a log ==')
   check('the whole prompt is returned unclipped',
-    turnPrompt(sessionLogs.get('session-long'), 1) === longTurnPrompt,
-    String(String(turnPrompt(sessionLogs.get('session-long'), 1)).length))
+    turnPrompt(sessionLogs.get('session-long'), 1)?.text === longTurnPrompt,
+    String(String(turnPrompt(sessionLogs.get('session-long'), 1)?.text).length))
   check('an unknown turn answers null', turnPrompt(sessionLogs.get('session-long'), 7) === null,
     JSON.stringify(turnPrompt(sessionLogs.get('session-long'), 7)))
   check('a log that is not an array answers null', turnPrompt(undefined, 1) === null,
     JSON.stringify(turnPrompt(undefined, 1)))
+  // The images come out of the same fold as the text: a message carrying both is
+  // one request, and reading them apart is what would let the two halves drift.
+  const withImages = turnPrompt([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    {
+      type: 'user/message',
+      seq: 2,
+      time: 2,
+      data: {
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', attachment: { attachmentId: 'att-9', mediaType: 'image/png' } },
+          { type: 'image', attachment: { attachmentId: '', mediaType: 'image/png' } },
+        ],
+      },
+    },
+  ], 1)
+  check('the whole-request read carries the images too',
+    withImages?.images?.length === 1 && withImages.images[0].attachmentId === 'att-9',
+    JSON.stringify(withImages))
   check('the first user message stays the prompt, not the steering one',
     turnPrompt([
       { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
       { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '原始请求' }] } },
       { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '插话' }] } },
-    ], 1) === '原始请求',
+    ], 1)?.text === '原始请求',
     JSON.stringify(turnPrompt([
       { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
       { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '原始请求' }] } },

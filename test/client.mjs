@@ -195,11 +195,21 @@ let storedEnabled = true
 let storedHistory = true
 let storedInterval = 1
 
-/** The timeline the fake host serves, including one turn that never closed. */
+/**
+ * The timeline the fake host serves, including one turn that never closed.
+ *
+ * The first two turns are 27 seconds apart **inside the same minute** on
+ * purpose: that is the case a `HH:MM`-only stamp cannot tell apart, and it is
+ * the reason the card's timestamp carries seconds at all. The third turn's `at`
+ * is 0 — the unknown case, which must render as nothing rather than as 1970.
+ */
+const FIRST_TURN_AT = Date.parse('2026-09-13T14:05:32+08:00')
+const SECOND_TURN_AT = Date.parse('2026-09-13T14:05:59+08:00')
+
 let timelineTurns = [
   {
     turn: 1,
-    at: 0,
+    at: FIRST_TURN_AT,
     prompt: '实现登录接口',
     seq: 10,
     steps: 2,
@@ -208,7 +218,7 @@ let timelineTurns = [
   },
   {
     turn: 2,
-    at: 0,
+    at: SECOND_TURN_AT,
     prompt: '把登录返回值改成 ok',
     seq: 20,
     steps: 1,
@@ -220,11 +230,11 @@ let timelineTurns = [
 ]
 
 /**
- * The whole prompt behind each turn, as `/chat-git/turn-prompt` serves it.
+ * The whole request behind each turn, as `/chat-git/turn-prompt` serves it.
  *
  * Deliberately different from the `prompt` on {@link timelineTurns}: that one is
- * the display clip, and a resend that quietly sent the clip instead of the whole
- * prompt is exactly the bug this separation makes observable.
+ * the display clip, and a hand-off that quietly handed over the clip instead of
+ * the whole request is exactly the bug this separation makes observable.
  */
 const wholePrompts = {
   1: '实现登录接口，并且把返回值统一改成 { ok: true } 的形式，另外记得补上失败分支的测试。',
@@ -232,37 +242,46 @@ const wholePrompts = {
   3: '正在进行的一轮',
 }
 
-/** Prompts the fake conversation service was asked to send, in order. */
+/**
+ * The durable image handles behind each turn, as `/chat-git/turn-prompt` serves
+ * them.
+ *
+ * Turn 2 deliberately carries two of them: a hand-off that dropped the pictures
+ * would rebuild the line from a question the user never asked, and the count is
+ * what makes that observable.
+ */
+const wholePromptImages = {
+  2: [{ attachmentId: 'att-b' }, { attachmentId: 'att-c' }],
+}
+
+/**
+ * Prompts anything asked the deployment to *send*, in order.
+ *
+ * Deliberately never written to: the whole point of 编辑并发送 is that it stops at
+ * the composer, so an empty log is itself the evidence that nothing was queued.
+ */
 const sentPrompts = []
 
 /** Sessions the fake workspace service archived. */
 const archived = []
 
 /**
- * Model routes the fake `/chat-git/set-model` route accepted, in order.
+ * What the headless composer seeder wrote into a draft, in order.
  *
- * Recorded rather than merely answered: the whole point of the picker is the
- * *order* — the selection has to be written before `sessions.create`/`fork`,
- * because both build their child from the default selection.
+ * 编辑并发送 sends nothing: it hands the request to the new conversation's
+ * composer. That hand-off is the whole observable behaviour, so the test drives
+ * the seeder seat itself and records exactly what it was handed.
  */
-const appliedModels = []
+const seededDrafts = []
 
-/**
- * How the fake `/chat-git/set-model` route refuses, when it should.
- *
- * Set to an error code to make the route refuse: a deployment whose model layer
- * rejects the write must leave the conversation exactly where it was.
- */
-let modelSwitchRefused = ''
+/** Draft image ids the seeder added, one entry per `addImages` call. */
+const seededImages = []
 
-/**
- * Ordered log of the writes that decide which model the rebuilt line runs on.
- *
- * The order is the whole point: `sessions.create`/`fork` take their route from
- * the default selection, so a `/chat-git/set-model` that arrived *after* either
- * call would leave the new line on the old model while looking correct.
- */
-const modelOrder = []
+/** The `InputActions` face the seeder consumes — only the two writes it makes. */
+const composerActions = {
+  setDraft: (text) => { seededDrafts.push(text) },
+  addImages: (ids) => { seededImages.push([...ids]) },
+}
 
 /**
  * The repository the fake host reports for the workspace pane.
@@ -354,9 +373,19 @@ globalThis.fetch = async (url, init) => {
   } else if (url === '/chat-git/timeline') {
     payload = { ok: true, value: { cwd: 'C:/ws', turns: timelineTurns } }
   } else if (url === '/chat-git/turn-prompt') {
-    // The whole prompt, unclipped — deliberately longer than the card's clip so
-    // a resend that used the displayed prompt instead would be visible.
-    payload = { ok: true, value: { turn: body.turn, prompt: wholePrompts[body.turn] ?? '' } }
+    // The whole request, unclipped — deliberately longer than the card's clip so
+    // a hand-off that used the displayed prompt instead would be visible. Text
+    // and images are separate fields because the browser half treats them
+    // differently: the text is written into the composer, each image handle is
+    // re-read through the source session before it can join the draft.
+    payload = {
+      ok: true,
+      value: {
+        turn: body.turn,
+        text: wholePrompts[body.turn] ?? '',
+        images: wholePromptImages[body.turn] ?? [],
+      },
+    }
   } else if (url === '/chat-git/repo') {
     if (repoUnreachable) throw new Error('route not mounted')
     // Mirrors the host: an empty sessionId is refused, because the workspace
@@ -371,21 +400,6 @@ globalThis.fetch = async (url, init) => {
     // pane marks is the restored commit and it is now a *known* position.
     repoState = { ...repoState, position: body.sha, positionKnown: true }
     payload = { ok: true, value: { restored: body.sha, removed: ['extra.txt'] } }
-  } else if (url === '/chat-git/set-model') {
-    // Mirrors the host: the route validates against the live registry before it
-    // writes anything, so an unregistered route is refused rather than stored.
-    if (modelSwitchRefused !== '') {
-      payload = { ok: false, error: { code: modelSwitchRefused, message: modelSwitchRefused } }
-    } else if (body.provider === 'no-such-provider' || body.model === 'no-such-model') {
-      payload = {
-        ok: false,
-        error: { code: 'unknown-model', message: 'that model is not registered in this deployment' },
-      }
-    } else {
-      appliedModels.push({ provider: body.provider, model: body.model })
-      modelOrder.push('set-model')
-      payload = { ok: true, value: { provider: body.provider, model: body.model } }
-    }
   } else if (url === '/chat-git/models') {
     payload = {
       ok: true,
@@ -498,17 +512,14 @@ const effects = []
 
 const forkedSessions = []
 
-/** Sessions the plugin asked the host to create outright (a first-turn resend). */
+/** Sessions the plugin asked the host to create outright (a first-turn hand-off). */
 const createdSessions = []
 
-/**
- * Whether the fake deployment mounts the conversation controller.
- *
- * The resend prefers `ctx.conversation.send` and falls back to the session
- * face's own `prompt`; flipping this is what exercises the second path, so the
- * fallback is covered rather than merely written.
- */
-let conversationAvailable = true
+/** Attachment ids the plugin re-read through the source session, in order. */
+const readAttachments = []
+
+/** How many files each `createDraftImages` call was handed. */
+const draftedFiles = []
 
 /** The injection whose callback is currently running, if any. */
 let activeInjection = null
@@ -517,25 +528,32 @@ const ctx = {
   sessions: {
     fork: async ({ sessionId, atSeq }) => {
       forkedSessions.push({ sessionId, atSeq })
-      modelOrder.push('fork')
       return 'session-fork-9'
     },
     create: async (opts = {}) => {
       createdSessions.push(opts)
-      modelOrder.push('create')
       return 'session-new-7'
     },
     open: () => {},
-    /** The scope-addressed hop the resend takes to reach `conversation`. */
-    scope: () => (conversationAvailable
-      ? {
-        get: (name) => (name === 'conversation'
-          ? { send: async (text) => { sentPrompts.push(text) } }
-          : undefined),
-      }
-      : undefined),
+    /**
+     * The session face. Its `readAttachment` is the only way back to an image's
+     * bytes, and it is deliberately the *source* session the plugin asks: the
+     * new line is cut before the chosen turn, so those durable references are
+     * not in its log and could not be authorized there.
+     */
     binding: () => ({
       session: {
+        readAttachment: async (attachmentId) => {
+          readAttachments.push(attachmentId)
+          return {
+            ok: true,
+            value: {
+              attachment: { attachmentId, mediaType: 'image/png', name: `${attachmentId}.png` },
+              data: Uint8Array.from([1, 2, 3]),
+            },
+          }
+        },
+        /** Recorded, never asserted as a success: nothing here should call it. */
         prompt: async (content) => {
           sentPrompts.push(content[0].text)
           return { ok: true, value: { accepted: true } }
@@ -548,6 +566,17 @@ const ctx = {
     if (name === 'workspaces') {
       return {
         archiveSession: async (sessionId) => { archived.push(sessionId) },
+      }
+    }
+    if (name === 'conversation') {
+      return {
+        // The only way to mint draft-local ids, which is what `addImages`
+        // speaks: the browser's own attachment objects are private to the
+        // conversation plugin, so the hand-off goes through this one door.
+        createDraftImages: (files) => {
+          draftedFiles.push(files.length)
+          return files.map((file, index) => ({ id: `draft-${String(index)}`, file }))
+        },
       }
     }
     return undefined
@@ -598,7 +627,12 @@ plugin.apply(ctx)
 console.log('\n== slot registration ==')
 check('every inject callback completed', registrations.every((entry) => entry.pending === false),
   JSON.stringify(registrations.filter((entry) => entry.pending).map((entry) => entry.injectName)))
-check('three seats are registered, the History tab among them', registrations.length === 3,
+check('four seats are registered, the History tab among them', registrations.length === 4,
+  JSON.stringify(registrations.map((entry) => entry.injectName)))
+// The fourth seat is headless: 编辑并发送 hands its request to a composer that
+// does not exist yet, and this is the entry that carries the hand-off out.
+check('the headless composer seeder rides the composer dock',
+  registrations.some((entry) => entry.injectName === 'conversation.input.dock'),
   JSON.stringify(registrations.map((entry) => entry.injectName)))
 
 const actions = registrations.find((entry) => entry.injectName === 'conversation.chat.assistant-actions')
@@ -1003,6 +1037,37 @@ const cardAt = (chrono) => cardsOf(panel)[timelineTurns.length - 1 - chrono]
 check('one card per turn', cards.length === 3, String(cards.length))
 const panelText = textOf(panel)
 check('a card names its turn', panelText.includes('第 1 轮'), JSON.stringify(panelText.slice(0, 160)))
+/**
+ * One timestamp rendered the way the card renders it, in this machine's zone.
+ *
+ * Recomputed rather than hardcoded because the card formats *local* time: a
+ * literal would only pass in the timezone the fixture was written in, and the
+ * one property worth pinning is the shape (`YYYY-MM-DD HH:MM:SS`), not the
+ * offset this test happens to run at.
+ */
+const pad = (value) => String(value).padStart(2, '0')
+const localStamp = (at) => {
+  const date = new Date(at)
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + ` ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+// The date, not just the clock: `14:05` cannot answer "was that today, yesterday,
+// or last week", which is the first thing a history list is read for.
+check('a card carries the full date and the time of day',
+  panelText.includes(localStamp(FIRST_TURN_AT)), JSON.stringify(panelText.slice(0, 260)))
+check('the timestamp is written to the second',
+  /(^|\s)\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\s|$)/.test(panelText),
+  JSON.stringify(panelText.match(/\d{4}-\d{2}-\d{2}[^,，。]*/g)))
+// Two turns of one conversation routinely close inside the same minute, and a
+// list that shows them identically is unreadable in exactly the case it matters.
+check('two turns of the same minute still read differently',
+  localStamp(FIRST_TURN_AT) !== localStamp(SECOND_TURN_AT)
+  && panelText.includes(localStamp(SECOND_TURN_AT)),
+  JSON.stringify([localStamp(FIRST_TURN_AT), localStamp(SECOND_TURN_AT)]))
+// An unknown timestamp renders as nothing at all. Falling back to the epoch
+// would print 1970 and read as a real, very old turn.
+check('a turn with no recorded time shows no timestamp',
+  !textOf(cardAt(2)).includes('1970'), JSON.stringify(textOf(cardAt(2)).slice(0, 160)))
 // Newest first: the turn the conversation is standing on is the one the actions
 // are usually aimed at, so reaching it must not mean scrolling the whole log.
 check('the cards list the newest turn first',
@@ -1075,9 +1140,12 @@ console.log('\n== each card offers all three conversation actions ==')
 check('every card carries exactly the three buttons',
   cards.every((card) => findAll(card, 'button').length === 3),
   JSON.stringify(cards.map((card) => findAll(card, 'button').length)))
+// 编辑并发送, not 编辑并重新发送: the action no longer sends. It rebuilds the
+// conversation and hands the request to the new composer, so the label has to
+// describe where the user is being taken rather than what the plugin will do.
 check('the buttons are labelled as asked',
   findAll(cardAt(0), 'button').map((btn) => textOf(btn)).join('|')
-    === '从这里 fork|回退到这里|编辑并重新发送',
+    === '从这里 fork|回退到这里|编辑并发送',
   findAll(cardAt(0), 'button').map((btn) => textOf(btn)).join('|'))
 check('a turn with no closing sequence cannot branch',
   findAll(cardAt(2), 'button').every((btn) => btn.props?.disabled === true),
@@ -1085,190 +1153,136 @@ check('a turn with no closing sequence cannot branch',
 check('the panel explains why that turn cannot branch',
   panelText.includes('没有结束序列'), JSON.stringify(panelText.slice(-200)))
 
-console.log('\n== the resend editor is seeded from the whole prompt ==')
+console.log('\n== 编辑并发送 hands the request over instead of sending it ==')
 // The card shows a *clip* of the prompt — `/chat-git/timeline` truncates it for
-// display. Resending that clip would quietly ask the model for something the
-// user never wrote, so the editor has to be seeded from the separate whole-prompt
-// read, and the fake host gives the two deliberately different text.
+// display. Handing that clip over would quietly rebuild the line from a question
+// the user never asked, so the whole request comes from its own route, and the
+// fake host gives the two deliberately different text.
+const beforeEditForks = forkedSessions.length
+const beforeEditCreates = createdSessions.length
+archived.length = 0
 findAll(cardAt(0), 'button')[2].props.onClick()
 await tick()
+await tick()
 panel = render(panelNode)
-const editorOf = (tree) => findAll(tree, 'textarea')[0]
-const editor = editorOf(panel)
-check('clicking the third action opens an editor',
-  editor !== undefined, JSON.stringify(findAll(panel, 'textarea').length))
-check('the whole prompt is read from the host, not the card',
+check('the whole request is read from the host, not the card',
   requests.some((entry) => entry.url === '/chat-git/turn-prompt'
     && entry.body.sessionId === 'session-live-1' && entry.body.turn === 1),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/turn-prompt').map((entry) => entry.body)))
-check('the editor is seeded with the whole prompt',
-  editor?.props?.value === wholePrompts[1], JSON.stringify(editor?.props?.value))
-check('the seeded text is longer than the card\'s clip',
-  String(editor?.props?.value ?? '').length > String(cardAt(0) && textOf(cardAt(0))).length
-  && editor?.props?.value !== timelineTurns[0].prompt,
-  JSON.stringify({ seeded: editor?.props?.value, card: timelineTurns[0].prompt }))
-check('the editor is labelled for assistive tech', editor?.props?.['aria-label'] === '编辑提示词',
-  String(editor?.props?.['aria-label']))
-const resendDialogText = textOf(dialogOf(panel))
-check('the resend dialog names the turn', resendDialogText.includes('第 1 轮'),
-  JSON.stringify(resendDialogText.slice(-320)))
-check('the resend dialog says the later turns go away',
-  resendDialogText.includes('删掉这一轮及其之后'), JSON.stringify(resendDialogText.slice(-320)))
-check('the resend dialog says the original is archived',
-  resendDialogText.includes('归档'), JSON.stringify(resendDialogText.slice(-320)))
-check('the resend dialog confirms with its own wording',
-  findAll(dialogOf(panel), 'button').map((btn) => textOf(btn)).join('|') === '删除并重新发送|取消',
-  findAll(dialogOf(panel), 'button').map((btn) => textOf(btn)).join('|'))
-check('the resend dialog never offers fork or rewind',
-  !findAll(dialogOf(panel), 'button').some((btn) => /fork|回退/.test(textOf(btn))),
-  JSON.stringify(findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))))
-
-console.log('\n== the resend dialog lets the model be re-picked ==')
-// Choosing a model is part of this dialog rather than a separate step: the
-// rebuilt line runs on the deployment's default selection, so the choice has to
-// be written before the session is created or forked — a picker shown after the
-// fact would be describing a decision that was already made.
-const picker = findAll(dialogOf(panel), 'select')[0]
-check('the dialog offers a model picker', picker !== undefined,
-  JSON.stringify(findAll(dialogOf(panel), 'select').length))
-check('the picker is labelled for assistive tech',
-  picker?.props?.['aria-label'] === '重新发送使用的模型', String(picker?.props?.['aria-label']))
-check('the picker lists one option per registered model',
-  (picker?.props?.children ?? []).length === 2,
-  JSON.stringify((picker?.props?.children ?? []).map((option) => option?.props?.value)))
-check('an option names both the provider and the model',
-  textOf((picker?.props?.children ?? [])[0]) === 'DeepSeek / V4 Flash',
-  JSON.stringify(textOf((picker?.props?.children ?? [])[0])))
-// Seeded with the route the deployment would use anyway, so the control reads as
-// "change this if you want" rather than as a question that must be answered.
-check('the picker is seeded with the current route', picker?.props?.value === '0',
-  String(picker?.props?.value))
-check('a provider with no models contributes no option',
-  !(picker?.props?.children ?? []).some((option) => textOf(option).includes('Bare')),
-  JSON.stringify((picker?.props?.children ?? []).map((option) => textOf(option))))
-// The catalogue read happens while the dialog opens, alongside the whole-prompt
-// read: a picker that populated itself a moment later would look like a failure.
-check('the model list is read before the dialog is usable',
-  requests.some((entry) => entry.url === '/chat-git/models'),
-  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/models').length))
-picker?.props?.onChange({ target: { value: '1' } })
-panel = render(panelNode)
-check('choosing another model updates the picker',
-  findAll(dialogOf(panel), 'select')[0]?.props?.value === '1',
-  String(findAll(dialogOf(panel), 'select')[0]?.props?.value))
-check('choosing a model sends nothing on its own',
-  appliedModels.length === 0, JSON.stringify(appliedModels))
-
-console.log('\n== an emptied prompt cannot be resent ==')
-// An empty box is the one way this dialog can be refused, and it must be
-// refused *before* the conversation moves: sending nothing after truncating
-// would destroy turns for no reason.
-const beforeEmptyFork = forkedSessions.length
-const beforeEmptyCreate = createdSessions.length
-editorOf(panel).props.onChange({ target: { value: '   ' } })
-panel = render(panelNode)
-const emptiedConfirm = findAll(dialogOf(panel), 'button')[0]
-check('an emptied editor disables the confirm', emptiedConfirm?.props?.disabled === true,
-  String(emptiedConfirm?.props?.disabled))
-check('the dialog says why it is refused', textOf(dialogOf(panel)).includes('提示词不能为空'),
-  JSON.stringify(textOf(dialogOf(panel)).slice(-200)))
-emptiedConfirm.props.onClick()
-await tick()
-check('a refused resend moves no conversation',
-  forkedSessions.length === beforeEmptyFork && createdSessions.length === beforeEmptyCreate,
-  JSON.stringify({ forks: forkedSessions.length, created: createdSessions.length }))
-
-console.log('\n== resending the first turn starts a fresh session ==')
 // Turn 1 has no turn before it, so there is no boundary to fork at: forking at
-// nothing would keep the whole conversation. A new session in the same
+// nothing would keep the whole conversation. A fresh session in the same
 // workspace is the honest expression of "nothing before this turn is kept".
-archived.length = 0
-sentPrompts.length = 0
-const editedFirst = '实现登录接口，返回值统一改成 ok，并补上失败分支的测试。'
-editorOf(panel).props.onChange({ target: { value: editedFirst } })
-panel = render(panelNode)
-findAll(dialogOf(panel), 'button')[0].props.onClick()
-await tick()
-await tick()
-await tick()
-check('the first turn resends into a newly created session',
-  createdSessions.length === 1 && forkedSessions.length === beforeEmptyFork,
-  JSON.stringify({ created: createdSessions, forks: forkedSessions.slice(beforeEmptyFork) }))
+check('the first turn rebuilds into a newly created session',
+  createdSessions.length === beforeEditCreates + 1 && forkedSessions.length === beforeEditForks,
+  JSON.stringify({ created: createdSessions.slice(beforeEditCreates), forks: forkedSessions.slice(beforeEditForks) }))
 check('the new session keeps the conversation workspace',
-  createdSessions[0]?.cwd === 'C:/ws', JSON.stringify(createdSessions[0]))
-// The model has to be written *before* the session is built: `sessions.create`
-// and `sessions.fork` both take their route from the default selection, so a
-// switch that arrived afterwards would leave the new line on the old model.
-check('the chosen model is written before the conversation moves',
-  appliedModels.length === 1 && appliedModels[0].provider === 'deepseek-official'
-  && appliedModels[0].model === 'deepseek-v4-pro',
-  JSON.stringify(appliedModels))
-check('the model switch happens before the session is built',
-  modelOrder.indexOf('set-model') >= 0
-  && modelOrder.indexOf('set-model') < modelOrder.indexOf('create'),
-  JSON.stringify(modelOrder))
-check('the edited prompt is what gets sent', sentPrompts.at(-1) === editedFirst,
-  JSON.stringify(sentPrompts))
-check('the edited text is trimmed before it is sent',
-  sentPrompts.at(-1) === editedFirst.trim(), JSON.stringify(sentPrompts.at(-1)))
+  createdSessions.at(-1)?.cwd === 'C:/ws', JSON.stringify(createdSessions.at(-1)))
+check('a first-turn hand-off inherits nothing, because nothing survives',
+  !requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.to === 'session-new-7'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
 check('the original conversation is archived',
   archived.length === 1 && archived[0] === 'session-live-1', JSON.stringify(archived))
-check('a first-turn resend inherits nothing, because nothing survives',
-  !requests.some((entry) => entry.url === '/chat-git/inherit'
-    && entry.body.to === 'session-new-7'),
-  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
+// The whole point of this action: it stops at the composer. The previous
+// behaviour queued the text immediately, which made the model answer before the
+// user had any chance to change their mind.
+check('nothing was sent', sentPrompts.length === 0, JSON.stringify(sentPrompts))
 
-console.log('\n== resending a later turn forks at the turn before it ==')
-// The boundary belongs to the turn *before* the edited one — the edited turn and
-// everything after it are what disappear.
+console.log('\n== the parked request is written by the composer that mounts later ==')
+// The composer belongs to another plugin and does not exist yet when the action
+// runs, so the hand-off is a parked request plus a headless seat that collects it
+// on mount. Rendering that seat is the only way to observe the hand-off.
+const seeder = registrations.find((entry) => entry.injectName === 'conversation.input.dock')
+check('the seeder is a headless composer dock entry',
+  seeder?.options?.id === 'chat-git-seed' && typeof seeder?.component === 'function',
+  JSON.stringify(seeder?.options))
+const seedInto = (sessionId) => render(ReactStub.createElement(seeder.component, {
+  sessionId,
+  inputActions: composerActions,
+}))
+seededDrafts.length = 0
+seededImages.length = 0
+seedInto('session-new-7')
+check('the seeder writes the whole prompt into the draft',
+  seededDrafts.at(-1) === wholePrompts[1], JSON.stringify(seededDrafts))
+// Compared against the *clip* the card shows, not against the card's whole
+// text: the card also carries a turn number and a timestamp now, so measuring
+// the card would let a hand-off that passed the clip through still look longer.
+check('the draft is longer than the card\'s clip',
+  String(seededDrafts.at(-1) ?? '').length > timelineTurns[0].prompt.length
+  && seededDrafts.at(-1) !== timelineTurns[0].prompt,
+  JSON.stringify({ seeded: seededDrafts.at(-1), card: timelineTurns[0].prompt }))
+check('a text-only turn adds no images', seededImages.length === 0, JSON.stringify(seededImages))
+// Taking is destructive: a second mount of the same session (the user navigating
+// away and back) must not overwrite whatever they have typed since.
+seededDrafts.length = 0
+seedInto('session-new-7')
+check('the request is taken once, not replayed on every mount',
+  seededDrafts.length === 0, JSON.stringify(seededDrafts))
+
+console.log('\n== a later turn forks at the turn before it and carries its images ==')
+// The boundary belongs to the turn *before* the chosen one — the chosen turn and
+// everything after it are what disappear. The images matter as much as the text:
+// a hand-off that kept the words and dropped the pictures would rebuild the line
+// from a question the user never asked.
 panel = render(panelNode)
 await tick()
 panel = render(panelNode)
 const beforeLaterFork = forkedSessions.length
 const beforeLaterCreate = createdSessions.length
 const beforeLaterArchived = archived.length
-sentPrompts.length = 0
+readAttachments.length = 0
+draftedFiles.length = 0
+seededDrafts.length = 0
+seededImages.length = 0
 findAll(cardsOf(panel)[1], 'button')[2].props.onClick()
-await tick()
-panel = render(panelNode)
-const laterEditor = findAll(panel, 'textarea')[0]
-check('the editor is seeded from that turn\'s own prompt',
-  laterEditor?.props?.value === wholePrompts[2], JSON.stringify(laterEditor?.props?.value))
-findAll(dialogOf(panel), 'button')[0].props.onClick()
-await tick()
 await tick()
 await tick()
 check('the later turn forks instead of creating',
   forkedSessions.length === beforeLaterFork + 1 && createdSessions.length === beforeLaterCreate,
   JSON.stringify({ forks: forkedSessions.slice(beforeLaterFork), created: createdSessions.slice(beforeLaterCreate) }))
-check('the fork boundary is the turn before the edited one',
+check('the fork boundary is the turn before the chosen one',
   forkedSessions.at(-1)?.atSeq === 10, JSON.stringify(forkedSessions.at(-1)))
 check('the surviving checkpoints go to the new line',
   requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.turn === 1),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
-check('the unedited prompt is resent as it stands', sentPrompts.at(-1) === wholePrompts[2],
-  JSON.stringify(sentPrompts))
-check('the second resend archives its original too',
+check('the second hand-off archives its original too',
   archived.length === beforeLaterArchived + 1, JSON.stringify(archived))
+// The images are re-read through the *source* session: the new line was cut
+// before the chosen turn, so those durable references are not in its log and it
+// could not authorize their bytes itself.
+check('each image is re-read through the source session',
+  readAttachments.join(',') === 'att-b,att-c', JSON.stringify(readAttachments))
+check('the re-read images become draft images',
+  draftedFiles.at(-1) === 2, JSON.stringify(draftedFiles))
+seedInto('session-fork-9')
+check('the later turn hands over its own prompt',
+  seededDrafts.at(-1) === wholePrompts[2], JSON.stringify(seededDrafts))
+check('the images travel with the text',
+  JSON.stringify(seededImages.at(-1)) === '["draft-0","draft-1"]', JSON.stringify(seededImages))
+check('nothing was sent for the later turn either',
+  sentPrompts.length === 0, JSON.stringify(sentPrompts))
 
-console.log('\n== a deployment without the conversation service still resends ==')
-// `ctx.conversation` and this plugin are separate packages, so the resend keeps
-// a real second path rather than assuming the controller is mounted.
-conversationAvailable = false
+console.log('\n== a deployment without the conversation service still hands the text over ==')
+// `ctx.conversation` and this plugin are separate packages, so the image
+// re-read degrades rather than taking the whole action down: minting a draft id
+// is that service's job, and without it there is no id to add. The text is the
+// part that must survive, and it does.
+const realGet = ctx.get
+ctx.get = (name) => (name === 'conversation' ? undefined : realGet(name))
 panel = render(panelNode)
 await tick()
 panel = render(panelNode)
-sentPrompts.length = 0
+seededDrafts.length = 0
+seededImages.length = 0
 findAll(cardAt(0), 'button')[2].props.onClick()
 await tick()
-panel = render(panelNode)
-findAll(dialogOf(panel), 'button')[0].props.onClick()
 await tick()
-await tick()
-await tick()
-check('the session face carries the prompt when the controller is absent',
-  sentPrompts.at(-1) === wholePrompts[1], JSON.stringify(sentPrompts))
-conversationAvailable = true
+seedInto('session-new-7')
+check('the text still reaches the composer without the conversation service',
+  seededDrafts.at(-1) === wholePrompts[1], JSON.stringify(seededDrafts))
+check('and no image id is invented when none could be minted',
+  seededImages.length === 0, JSON.stringify(seededImages))
+ctx.get = realGet
 panel = render(panelNode)
 await tick()
 panel = render(panelNode)

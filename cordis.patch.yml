@@ -2,7 +2,7 @@
 # profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
 # manifest field) over dsh-base; activate with
 #
-#   dsh plugin --profile web add link:E:/Porject/My_project/DsChatGit
+#   dsh plugin --profile web add link:./dsh-chat-git
 #
 # The row is a bare plugin by package name: the node half (exports ".") runs in
 # the host process (session git checkpoints + /chat-git/* HTTP routes), and the

@@ -124,33 +124,62 @@
 - **DeepSeek Harness**，并有一个可用的 profile（下面以 `web` 为例）；
 - **git**（可选但强烈建议；未安装时插件会检测到并给出下载入口，只是无法提交检查点）。
 
-### 方式一：从 GitHub 源码安装（推荐）
+### 方式一：从 GitHub 直接安装（推荐）
+
+```bash
+dsh plugin --profile web add github:NOOB-P/dsh-chat-git
+```
+
+pnpm 会把这个 GitHub 仓库拉进 profile 的依赖里，`dsh` 随后按已安装状态重建层列表 —— 不必先手动 `git clone`。
+
+想改代码、随时 `git pull` 的话，先克隆再按本地路径安装：
 
 ```bash
 git clone https://github.com/NOOB-P/dsh-chat-git.git
-dsh plugin --profile web add link:./dsh-chat-git
+cd dsh-chat-git
+dsh plugin --profile web add link:.
 ```
 
-Windows 上路径写法：
+Windows 上用正斜杠或反斜杠都可以（在克隆出来的目录里执行）：
 
 ```powershell
-dsh plugin --profile web add link:E:/Porject/My_project/DsChatGit
+dsh plugin --profile web add link:.
 ```
 
-`dsh plugin --profile <name> ...` 是一条 pnpm 转发器：它在 profile 目录里执行 `pnpm`，然后**按已安装状态重建 `dsh.profile.bundles` 层列表** —— 任何能解析到「声明了 `dsh.bundle` 的包」的依赖都会自动加入层栈，本包正是这种情况，所以不必手改 profile 的 `package.json`。
+### 方式二：下载 release 里的 tarball 安装
 
-### 方式二：从 tarball 安装
+从 [Releases](https://github.com/NOOB-P/dsh-chat-git/releases/latest) 下载 `dsh-chat-git-<版本>.tgz`，然后：
+
+```bash
+dsh plugin --profile web add ./dsh-chat-git-0.6.0.tgz
+```
+
+或者一条命令直接从 release 资产安装（无需先下载）：
+
+```bash
+dsh plugin --profile web add https://github.com/NOOB-P/dsh-chat-git/releases/download/v0.6.0/dsh-chat-git-0.6.0.tgz
+```
+
+也可以自己从源码打包再装：
 
 ```bash
 npm pack                    # 产出 dsh-chat-git-0.6.0.tgz
 dsh plugin --profile web add ./dsh-chat-git-0.6.0.tgz
 ```
 
+`dsh plugin --profile <name> ...` 是一条 pnpm 转发器：它在 profile 目录里执行 `pnpm`，然后**按已安装状态重建 `dsh.profile.bundles` 层列表** —— 任何能解析到「声明了 `dsh.bundle` 的包」的依赖都会自动加入层栈，本包正是这种情况，所以不必手改 profile 的 `package.json`。
+
 ### 更新
 
+按当初的安装方式二选一：
+
 ```bash
+# 装的是 github: 或 release tarball
+dsh plugin --profile web add github:NOOB-P/dsh-chat-git
+
+# 装的是本地克隆（link:）
 git pull
-dsh plugin --profile web add link:./dsh-chat-git   # 重新链接
+dsh plugin --profile web add link:.   # 重新链接
 ```
 
 ### 卸载

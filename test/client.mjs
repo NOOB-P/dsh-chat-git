@@ -216,6 +216,9 @@ let timelineTurns = [
     endReason: 'completed',
     commit: { sha: 'aaaa1111', short: 'aaaa111', subject: 'Ai-coding：实现登录接口' },
   },
+  // Two images on purpose: the card states the count, and the hand-off has to
+  // carry the handles through the source session. A turn with no images beside
+  // it is what keeps "always shows a count" from passing.
   {
     turn: 2,
     at: SECOND_TURN_AT,
@@ -223,6 +226,7 @@ let timelineTurns = [
     seq: 20,
     steps: 1,
     endReason: 'completed',
+    imageCount: 2,
     commit: { sha: 'bbbb2222', short: 'bbbb222', subject: 'Ai-coding：把登录返回值改成 ok' },
   },
   // Still running: no closing sequence, so it has no fork boundary.
@@ -1039,7 +1043,7 @@ const cardsOf = (tree) => findAll(tree, 'div')
  * The confirm dialog, read out of its own node.
  *
  * The dialog is a child of the panel, so collecting every button in the panel
- * would also pick up the card buttons, whose wording ("从这里 fork" /
+ * would also pick up the card buttons, whose wording ("从这里打开新对话" /
  * "回退到这里") legitimately names the same verbs and would drown out the
  * assertion about what the dialog itself offers.
  */
@@ -1168,8 +1172,16 @@ check('every card carries exactly the three buttons',
 // describe where the user is being taken rather than what the plugin will do.
 check('the buttons are labelled as asked',
   findAll(cardAt(0), 'button').map((btn) => textOf(btn)).join('|')
-    === '从这里 fork|回退到这里|编辑并发送',
+    === '从这里打开新对话(fork)|回退到这里(还原)|编辑并发送',
   findAll(cardAt(0), 'button').map((btn) => textOf(btn)).join('|'))
+// The turn remembered two images. The card states the count rather than drawing
+// thumbnails: a history list is a list, and the handles themselves are re-read by
+// the one action that moves them. A turn with no images must stay silent, which is
+// why the neighbouring card is checked too.
+check('a card with images says how many',
+  textOf(cardAt(1)).includes('含 2 张图片'), JSON.stringify(textOf(cardAt(1))))
+check('a card with no images says nothing about them',
+  !textOf(cardAt(0)).includes('图片'), JSON.stringify(textOf(cardAt(0))))
 check('a turn with no closing sequence cannot branch',
   findAll(cardAt(2), 'button').every((btn) => btn.props?.disabled === true),
   JSON.stringify(findAll(cardAt(2), 'button').map((btn) => btn.props?.disabled)))
@@ -1184,7 +1196,43 @@ console.log('\n== 编辑并发送 hands the request over instead of sending it =
 const beforeEditForks = forkedSessions.length
 const beforeEditCreates = createdSessions.length
 archived.length = 0
+// 编辑并发送 asks for a destination before it does anything. The two choices are
+// not recoverable from the card — 当前对话 replaces this conversation while
+// 新建对话 starts beside it — so clicking the card button must open the question
+// rather than pick one silently.
 findAll(cardAt(0), 'button')[2].props.onClick()
+panel = render(panelNode)
+const editDialogNode = dialogOf(panel)
+check('编辑并发送 opens a dialog before doing anything',
+  editDialogNode !== undefined, JSON.stringify(findAll(panel, 'div').length))
+const editDialogText = textOf(editDialogNode)
+check('the dialog names the turn it will rebuild',
+  editDialogText.includes('第 1 轮'), JSON.stringify(editDialogText.slice(-320)))
+check('the dialog states that the request is not sent automatically',
+  editDialogText.includes('不会自动发送'), JSON.stringify(editDialogText.slice(-320)))
+check('the dialog explains what 当前对话 does',
+  editDialogText.includes('当前对话') && editDialogText.includes('归档'),
+  JSON.stringify(editDialogText.slice(-320)))
+check('the dialog explains what 新建对话 does',
+  editDialogText.includes('新建对话') && editDialogText.includes('保持原样'),
+  JSON.stringify(editDialogText.slice(-320)))
+const editLabels = findAll(editDialogNode, 'button').map((btn) => textOf(btn))
+check('the edit dialog offers exactly the three choices',
+  editLabels.join('|') === '当前对话|新建对话|取消', JSON.stringify(editLabels))
+check('opening the edit dialog reads nothing yet',
+  !requests.some((entry) => entry.url === '/chat-git/turn-prompt'),
+  JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/turn-prompt').map((entry) => entry.body)))
+// Cancelling is a real way out: the dialog closes and nothing was read, created,
+// forked, or archived.
+findAll(editDialogNode, 'button')[2].props.onClick()
+panel = render(panelNode)
+check('cancelling the edit dialog closes it without reading the request',
+  dialogOf(panel) === undefined
+  && !requests.some((entry) => entry.url === '/chat-git/turn-prompt'),
+  JSON.stringify(findAll(panel, 'div').length))
+findAll(cardAt(0), 'button')[2].props.onClick()
+panel = render(panelNode)
+findAll(dialogOf(panel), 'button')[1].props.onClick()
 await tick()
 await tick()
 panel = render(panelNode)
@@ -1271,6 +1319,8 @@ draftedFiles.length = 0
 seededDrafts.length = 0
 seededImages.length = 0
 findAll(cardsOf(panel)[1], 'button')[2].props.onClick()
+panel = render(panelNode)
+findAll(dialogOf(panel), 'button')[1].props.onClick()
 await tick()
 await tick()
 check('the later turn forks instead of creating',
@@ -1315,6 +1365,8 @@ panel = render(panelNode)
 seededDrafts.length = 0
 seededImages.length = 0
 findAll(cardAt(0), 'button')[2].props.onClick()
+panel = render(panelNode)
+findAll(dialogOf(panel), 'button')[1].props.onClick()
 await tick()
 await tick()
 seedInto('session-new-7')
@@ -1332,7 +1384,7 @@ findAll(cards[1], 'button')[0].props.onClick()
 panel = render(panelNode)
 const dialogLabels = findAll(dialogOf(panel), 'button').map((btn) => textOf(btn))
 check('the fork dialog confirms the fork and nothing else',
-  dialogLabels.join('|') === '确认 fork 对话|取消', JSON.stringify(dialogLabels))
+  dialogLabels.join('|') === '确认打开新对话|取消', JSON.stringify(dialogLabels))
 // A fork dialog that also says 回退 makes the user re-read the card button they
 // just pressed to work out which of the two they are in.
 check('a fork dialog never says 回退',
@@ -1356,7 +1408,7 @@ archived.length = 0
 const beforeFork = requests.filter((entry) => entry.url === '/chat-git/revert').length
 const beforeRestores = requests.filter((entry) => entry.url === '/chat-git/restore').length
 const beforeTimelineReads = requests.filter((entry) => entry.url === '/chat-git/timeline').length
-findAll(panel, 'button').find((btn) => textOf(btn) === '确认 fork 对话').props.onClick()
+findAll(panel, 'button').find((btn) => textOf(btn) === '确认打开新对话').props.onClick()
 await tick()
 await tick()
 await tick()

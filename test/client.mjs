@@ -539,8 +539,8 @@ let activeInjection = null
 
 const ctx = {
   sessions: {
-    fork: async ({ sessionId, atSeq }) => {
-      forkedSessions.push({ sessionId, atSeq })
+    fork: async ({ sessionId, atSeq, increaseTitle }) => {
+      forkedSessions.push({ sessionId, atSeq, increaseTitle })
       return 'session-fork-9'
     },
     create: async (opts = {}) => {
@@ -1211,8 +1211,13 @@ check('the placement never sends both workspaceId and cwd',
 check('a first-turn hand-off inherits nothing, because nothing survives',
   !requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.to === 'session-new-7'),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
-check('the original conversation is archived',
-  archived.length === 1 && archived[0] === 'session-live-1', JSON.stringify(archived))
+// The original is *left alone*, not archived. Archiving it made the action read
+// as "this conversation rolled back to the turn before": the sidebar entry the
+// user had just clicked lost its later turns, and the fork that replaced it
+// carried the same title, so the two read as one conversation that moved
+// backwards. 编辑并发送 is a fork — the original keeps every turn.
+check('the original conversation is not archived',
+  archived.length === 0, JSON.stringify(archived))
 // The whole point of this action: it stops at the composer. The previous
 // behaviour queued the text immediately, which made the model answer before the
 // user had any chance to change their mind.
@@ -1276,8 +1281,12 @@ check('the fork boundary is the turn before the chosen one',
 check('the surviving checkpoints go to the new line',
   requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.turn === 1),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))
-check('the second hand-off archives its original too',
-  archived.length === beforeLaterArchived + 1, JSON.stringify(archived))
+// Neither hand-off archives: 编辑并发送 is a fork, so the conversation the user
+// clicked keeps every turn and stays in the sidebar. Only 回退 archives.
+check('the second hand-off leaves its original alone too',
+  archived.length === beforeLaterArchived, JSON.stringify(archived))
+check('the forked line is given a distinguishable title',
+  forkedSessions.at(-1)?.increaseTitle === true, JSON.stringify(forkedSessions.at(-1)))
 // The images are re-read through the *source* session: the new line was cut
 // before the chosen turn, so those durable references are not in its log and it
 // could not authorize their bytes itself.

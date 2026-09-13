@@ -318,6 +318,75 @@ const beforeStart = buildTimeline([
 check('a user message before turn/start still becomes the prompt',
   beforeStart[0].prompt === '先到的消息', JSON.stringify(beforeStart[0].prompt))
 
+// Compaction replaces a span of the surface with a synthesized user message
+// carrying the summary. That replacement is a `user/message` like any other, so
+// without the source check the card for the *next* turn shows the checkpoint
+// preamble instead of what the user actually asked — and 编辑并重新发送 then hands
+// that preamble back to the model as if it were the request.
+const CHECKPOINT_TEXT = 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context.'
+const checkpointMessage = (seq, compactionId) => ({
+  type: 'user/message',
+  seq,
+  time: seq,
+  data: {
+    content: [{ type: 'text', text: CHECKPOINT_TEXT }],
+    source: { kind: 'plugin', plugin: 'compact', compactionId },
+  },
+})
+const afterCompaction = buildTimeline([
+  { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+  { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '第一轮的真实请求' }] } },
+  { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  { type: 'compaction/start', seq: 4, time: 4, data: { compactionId: 'c1' } },
+  { type: 'compaction/summary', seq: 5, time: 5, data: { compactionId: 'c1', summary: [] } },
+  checkpointMessage(6, 'c1'),
+  { type: 'turn/start', seq: 7, time: 7, data: { turn: 2 } },
+  { type: 'user/message', seq: 8, time: 8, data: { content: [{ type: 'text', text: '第二轮的请求' }] } },
+  { type: 'turn/end', seq: 9, time: 9, data: { turn: 2, reason: { kind: 'completed' } } },
+])
+check('a compaction checkpoint is not mistaken for the next turn\'s prompt',
+  afterCompaction[1].prompt === '第二轮的请求', JSON.stringify(afterCompaction[1].prompt))
+check('the turn before a compaction keeps its own prompt',
+  afterCompaction[0].prompt === '第一轮的真实请求', JSON.stringify(afterCompaction[0].prompt))
+check('the whole-prompt read skips a compaction checkpoint too',
+  turnPrompt(afterCompaction.length === 0 ? [] : [
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    checkpointMessage(2, 'c2'),
+    { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '真实请求' }] } },
+    { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+  ], 1) === '真实请求',
+  JSON.stringify(turnPrompt([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    checkpointMessage(2, 'c2'),
+    { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '真实请求' }] } },
+    { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+  ], 1)))
+check('a turn that only ever saw a checkpoint has no prompt',
+  buildTimeline([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    checkpointMessage(2, 'c3'),
+    { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ])[0].prompt === '',
+  JSON.stringify(buildTimeline([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    checkpointMessage(2, 'c3'),
+    { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ])[0].prompt))
+// A steering message the user typed after the checkpoint is still theirs: only
+// the harness's own marker is skipped, never a real message that happens to
+// follow one.
+check('a real message after a checkpoint is still kept',
+  buildTimeline([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    checkpointMessage(2, 'c4'),
+    { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '接着改' }] } },
+  ])[0].prompt === '接着改',
+  JSON.stringify(buildTimeline([
+    { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+    checkpointMessage(2, 'c4'),
+    { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '接着改' }] } },
+  ])[0].prompt))
+
 const retried = buildTimeline([
   { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
   { type: 'turn/end', seq: 2, time: 2, data: { turn: 1, reason: { kind: 'error', error: {} } } },

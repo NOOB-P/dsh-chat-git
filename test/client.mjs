@@ -992,17 +992,46 @@ check('the panel read the conversation timeline',
   requests.some((entry) => entry.url === '/chat-git/timeline' && entry.body.sessionId === 'session-live-1'),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/timeline').map((entry) => entry.body)))
 const cards = cardsOf(panel)
-check('one card per turn, in order', cards.length === 3, String(cards.length))
+/**
+ * The card for one chronological turn.
+ *
+ * The pane lists newest first, so the rendered order is the reverse of
+ * `timelineTurns`. Addressing a card by its chronological index keeps every
+ * block below from having to know that.
+ */
+const cardAt = (chrono) => cardsOf(panel)[timelineTurns.length - 1 - chrono]
+check('one card per turn', cards.length === 3, String(cards.length))
 const panelText = textOf(panel)
 check('a card names its turn', panelText.includes('第 1 轮'), JSON.stringify(panelText.slice(0, 160)))
-check('the cards keep the conversation order',
-  panelText.indexOf('实现登录接口') < panelText.indexOf('把登录返回值改成 ok'),
+// Newest first: the turn the conversation is standing on is the one the actions
+// are usually aimed at, so reaching it must not mean scrolling the whole log.
+check('the cards list the newest turn first',
+  panelText.indexOf('正在进行的一轮') < panelText.indexOf('把登录返回值改成 ok')
+  && panelText.indexOf('把登录返回值改成 ok') < panelText.indexOf('实现登录接口'),
   JSON.stringify(panelText.slice(0, 300)))
+check('the pane says which way the list runs',
+  panelText.includes('按时间倒序排列，最新一轮在最上面。'), JSON.stringify(panelText.slice(0, 200)))
 check('the panel counts the turns', panelText.includes('3 轮'), JSON.stringify(panelText.slice(0, 120)))
+check('the pane names the current turn in words',
+  panelText.includes('当前位置：第 3 轮'), JSON.stringify(panelText.slice(0, 200)))
+// The newest turn is tagged rather than merely listed first: once the list
+// scrolls, being the top row stops answering "which turn am I on".
+const currentCard = cards.find((card) => card.props?.['data-current'] === 'true')
+check('the newest turn is tagged as the current position',
+  currentCard !== undefined && textOf(currentCard).includes('正在进行的一轮'),
+  JSON.stringify(cards.map((card) => card.props?.['data-current'])))
+check('the current turn carries a 当前位置 label',
+  findAll(currentCard ?? null, 'span')
+    .some((span) => String(span.props?.className ?? '').includes('dsh-chat-git-here')
+      && textOf(span) === '当前位置'),
+  JSON.stringify(findAll(currentCard ?? null, 'span').map((span) => [span.props?.className, textOf(span)])))
+check('only one turn is marked as the current position',
+  cards.filter((card) => card.props?.['data-current'] === 'true').length === 1,
+  JSON.stringify(cards.map((card) => card.props?.['data-current'])))
 // The turn list must no longer echo the checkpoint: showing the same commit in
 // both columns was what made the two halves read as one coupled thing.
 check('a conversation card carries no commit line',
-  !textOf(cards[0]).includes('aaaa111'), JSON.stringify(textOf(cards[0])))
+  !textOf(cardAt(1)).includes('bbbb222'), JSON.stringify(textOf(cardAt(1))))
 
 console.log('\n== the workspace pane reads git on its own ==')
 // The two panes are independent reads: the left one never asks for a commit and
@@ -1047,12 +1076,12 @@ check('every card carries exactly the three buttons',
   cards.every((card) => findAll(card, 'button').length === 3),
   JSON.stringify(cards.map((card) => findAll(card, 'button').length)))
 check('the buttons are labelled as asked',
-  findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|')
+  findAll(cardAt(0), 'button').map((btn) => textOf(btn)).join('|')
     === '从这里 fork|回退到这里|编辑并重新发送',
-  findAll(cards[0], 'button').map((btn) => textOf(btn)).join('|'))
+  findAll(cardAt(0), 'button').map((btn) => textOf(btn)).join('|'))
 check('a turn with no closing sequence cannot branch',
-  findAll(cards[2], 'button').every((btn) => btn.props?.disabled === true),
-  JSON.stringify(findAll(cards[2], 'button').map((btn) => btn.props?.disabled)))
+  findAll(cardAt(2), 'button').every((btn) => btn.props?.disabled === true),
+  JSON.stringify(findAll(cardAt(2), 'button').map((btn) => btn.props?.disabled)))
 check('the panel explains why that turn cannot branch',
   panelText.includes('没有结束序列'), JSON.stringify(panelText.slice(-200)))
 
@@ -1061,7 +1090,7 @@ console.log('\n== the resend editor is seeded from the whole prompt ==')
 // display. Resending that clip would quietly ask the model for something the
 // user never wrote, so the editor has to be seeded from the separate whole-prompt
 // read, and the fake host gives the two deliberately different text.
-findAll(cards[0], 'button')[2].props.onClick()
+findAll(cardAt(0), 'button')[2].props.onClick()
 await tick()
 panel = render(panelNode)
 const editorOf = (tree) => findAll(tree, 'textarea')[0]
@@ -1075,7 +1104,7 @@ check('the whole prompt is read from the host, not the card',
 check('the editor is seeded with the whole prompt',
   editor?.props?.value === wholePrompts[1], JSON.stringify(editor?.props?.value))
 check('the seeded text is longer than the card\'s clip',
-  String(editor?.props?.value ?? '').length > String(cards[0] && textOf(cards[0])).length
+  String(editor?.props?.value ?? '').length > String(cardAt(0) && textOf(cardAt(0))).length
   && editor?.props?.value !== timelineTurns[0].prompt,
   JSON.stringify({ seeded: editor?.props?.value, card: timelineTurns[0].prompt }))
 check('the editor is labelled for assistive tech', editor?.props?.['aria-label'] === '编辑提示词',
@@ -1230,7 +1259,7 @@ panel = render(panelNode)
 await tick()
 panel = render(panelNode)
 sentPrompts.length = 0
-findAll(cardsOf(panel)[0], 'button')[2].props.onClick()
+findAll(cardAt(0), 'button')[2].props.onClick()
 await tick()
 panel = render(panelNode)
 findAll(dialogOf(panel), 'button')[0].props.onClick()
@@ -1300,7 +1329,7 @@ check('the view re-reads the timeline after acting',
 
 console.log('\n== rewinding archives the conversation it came from ==')
 panel = render(panelNode)
-const rewindCard = cardsOf(panel)[0]
+const rewindCard = cardAt(0)
 findAll(rewindCard, 'button')[1].props.onClick()
 panel = render(panelNode)
 const rewindDialogText = textOf(dialogOf(panel))

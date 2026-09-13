@@ -515,6 +515,19 @@ const forkedSessions = []
 /** Sessions the plugin asked the host to create outright (a first-turn hand-off). */
 const createdSessions = []
 
+/**
+ * The Workspace groupings the fake Workspace service reports.
+ *
+ * `session-live-1` — the conversation the panel is looking at — belongs to
+ * `ws-test`, which is what the first-turn rebuild has to be created *inside*.
+ * A second group is deliberately present so a lookup that simply took the first
+ * item would be observable.
+ */
+const workspaceItems = [
+  { workspaceId: 'ws-other', path: 'C:/other', title: 'other', sessionIds: ['session-elsewhere'] },
+  { workspaceId: 'ws-test', path: 'C:/ws', title: 'test', sessionIds: ['session-live-1'] },
+]
+
 /** Attachment ids the plugin re-read through the source session, in order. */
 const readAttachments = []
 
@@ -566,6 +579,16 @@ const ctx = {
     if (name === 'workspaces') {
       return {
         archiveSession: async (sessionId) => { archived.push(sessionId) },
+        /**
+         * The Workspace grouping surface. A first-turn rebuild has to land in
+         * the group the conversation came from, and the only place that fact
+         * lives is this snapshot: `sessions.create({ cwd })` reaches the host's
+         * `ensureSession` but never `attachSession`, so a directory-only create
+         * is published as 未分组 even when the directory *is* the group's path.
+         */
+        list: {
+          getSnapshot: () => ({ items: workspaceItems }),
+        },
       }
     }
     if (name === 'conversation') {
@@ -1175,8 +1198,16 @@ check('the whole request is read from the host, not the card',
 check('the first turn rebuilds into a newly created session',
   createdSessions.length === beforeEditCreates + 1 && forkedSessions.length === beforeEditForks,
   JSON.stringify({ created: createdSessions.slice(beforeEditCreates), forks: forkedSessions.slice(beforeEditForks) }))
-check('the new session keeps the conversation workspace',
-  createdSessions.at(-1)?.cwd === 'C:/ws', JSON.stringify(createdSessions.at(-1)))
+// Grouping, not merely a directory. `sessions.create({ cwd })` reaches the
+// host's `ensureSession` but never `attachSession`, so a directory-only create
+// is published as 未分组 even when that directory *is* the Workspace's own path
+// — which is exactly what the sidebar showed before this was fixed. The id has
+// to come from the source conversation's own group, not from the first item in
+// the list: the fixture's first group is deliberately someone else's.
+check('the new session is created inside the conversation workspace group',
+  createdSessions.at(-1)?.workspaceId === 'ws-test', JSON.stringify(createdSessions.at(-1)))
+check('the placement never sends both workspaceId and cwd',
+  createdSessions.at(-1)?.cwd === undefined, JSON.stringify(createdSessions.at(-1)))
 check('a first-turn hand-off inherits nothing, because nothing survives',
   !requests.some((entry) => entry.url === '/chat-git/inherit' && entry.body.to === 'session-new-7'),
   JSON.stringify(requests.filter((entry) => entry.url === '/chat-git/inherit').map((entry) => entry.body)))

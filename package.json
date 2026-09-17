@@ -1,7 +1,7 @@
 {
   "name": "dsh-chat-git",
   "version": "0.6.0",
-  "description": "DSH 插件：在对话内管理 Git 检查点、查看历史并按轮次回退工作区。",
+  "description": "DeepSeek Harness 对话与代码管理增强插件：自动为每轮 AI Coding 对话创建 Git 检查点，按轮追踪改动，支持历史查看、对话分叉、编辑重发，以及对话和工作区独立回退。让你放心尝试每个想法，代码随时可回到任意版本，告别误改、丢稿和上下文混乱。零运行时依赖，安装即用。",
   "keywords": [
     "dsh-plugin",
     "dsh",

@@ -1,8 +1,23 @@
 {
   "name": "dsh-chat-git",
   "version": "0.6.0",
-  "private": true,
-  "description": "DeepSeek Harness plugin: per-conversation git checkpoints — a repository check at conversation start (`git init` when there is none), an `Ai-coding：<description>` commit whenever a turn ends, and a one-click rollback that rewinds the conversation and the repository together.",
+  "description": "DSH 插件：在对话内管理 Git 检查点、查看历史并按轮次回退工作区。",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "git",
+    "DeepSeek Harness",
+    "checkpoints"
+  ],
+  "homepage": "https://github.com/NOOB-P/dsh-chat-git#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NOOB-P/dsh-chat-git.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NOOB-P/dsh-chat-git/issues"
+  },
+  "author": "NOOB-P",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

@@ -10,6 +10,26 @@
 
 每轮对话结束自动提交一次工作区，随时回到任意一轮的代码状态，或者只改对话不碰代码 —— 两条线互不干扰，而且每一步都能找回。
 
+## DSH Desktop 插件市场
+
+本插件通过 GitHub 仓库安装，安装后重启 DSH Desktop 即可加载：
+
+```bash
+dsh plugin --profile web add github:NOOB-P/dsh-chat-git
+```
+
+插件市场元信息位于 `package.json` 的 `dsh` 字段，profile bundle manifest 为
+`cordis.patch.yml`。仓库使用 MIT 协议，并通过 GitHub 的 `dsh-plugin` Topic
+参与社区插件索引。
+
+### 权限与数据访问
+
+- 在当前会话工作目录中读取 Git 状态、提交历史和变更，并按设置执行 `git init`、`git add`、`git commit` 以及用户确认的工作区还原。
+- 将会话与检查点映射写入 `$DSH_HOME/chat-git.json`；不会把 Git 操作扩展到当前工作目录之外。
+- 在 DSH Web 界面注入回退按钮、历史面板和设置项，通过本地 `/chat-git/*` 路由与宿主通信。
+- 启用提交标题总结时，会把本轮提示词和暂存变更摘要交给当前 DSH 模型生成提交标题；关闭该设置即可不调用模型总结。
+- 插件没有独立的远程服务，也没有运行时 npm 依赖；Git 是可选的系统级依赖。
+
 <!-- 截图占位：把图片放进 docs/ 后取消下面的注释
 <p align="center">
   <img src="docs/history-pane.png" alt="历史标签页：左侧对话、右侧工作区 Git" width="900">
